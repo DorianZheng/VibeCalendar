@@ -17,6 +17,7 @@ const Dashboard = () => {
     fetchEvents, 
     getAISuggestions,
     createEvent,
+    confirmAIAction,
     loading,
     sessionId,
     isGoogleConnected,
@@ -191,6 +192,18 @@ const Dashboard = () => {
       console.log('🔄 [CLIENT] Reset Pomodoro session due to new Google Calendar connection');
     }
   }, [sessionId]);
+
+  // Periodic event refresh (fallback for webhooks)
+  useEffect(() => {
+    if (!sessionId || !isGoogleConnected) return;
+
+    const refreshInterval = setInterval(() => {
+      console.log('🔄 [DASHBOARD] Periodic event refresh');
+      fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
+    }, 5 * 60 * 1000); // Refresh every 5 minutes
+
+    return () => clearInterval(refreshInterval);
+  }, [sessionId, isGoogleConnected, fetchEvents]);
 
   // Request notification permissions on mount
   useEffect(() => {
@@ -692,48 +705,44 @@ const Dashboard = () => {
       
       let aiMessage;
       
-      // Handle the new action-based response format
-      if (result.success && result.action === 'none') {
+      // Handle the new multiple actions response format
+      if (result.success && result.actions && result.actions.length === 0) {
         // AI is just chatting - show the message
         aiMessage = {
           id: Date.now() + 1,
           type: 'ai',
-          content: result.message
+          content: result.aiMessage
         };
         setChatMessages(prev => [...prev, aiMessage]);
-      } else if (result.success && result.action === 'create_event') {
-        // Event was created successfully
-        aiMessage = {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: result.message
-        };
-        setChatMessages(prev => [...prev, aiMessage]);
-      } else if (result.success && result.action === 'query_events') {
-        // Events were queried successfully
-        aiMessage = {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: result.message
-        };
-        setChatMessages(prev => [...prev, aiMessage]);
-      } else if (result.success && (result.action === 'update_event' || result.action === 'delete_event')) {
-        // These actions require user confirmation
-        aiMessage = {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: result.message,
-          requiresConfirmation: true,
-          action: result.action,
-          actionResult: result.actionResult
-        };
+      } else if (result.success && result.actions && result.actions.length > 0) {
+        // Multiple actions were performed
+        const hasConfirmationRequired = result.actionResults?.some(r => r.requiresConfirmation);
+        
+        if (hasConfirmationRequired) {
+          // Some actions require confirmation
+          aiMessage = {
+            id: Date.now() + 1,
+            type: 'ai',
+            content: result.aiMessage,
+            requiresConfirmation: true,
+            actions: result.actions,
+            actionResults: result.actionResults
+          };
+        } else {
+          // All actions completed successfully
+          aiMessage = {
+            id: Date.now() + 1,
+            type: 'ai',
+            content: result.aiMessage
+          };
+        }
         setChatMessages(prev => [...prev, aiMessage]);
       } else {
         // Action failed or error occurred
         aiMessage = {
           id: Date.now() + 1,
           type: 'ai',
-          content: result.message || "I'm having trouble with that request. Could you try rephrasing it?"
+          content: result.aiMessage || "I'm having trouble with that request. Could you try rephrasing it?"
         };
         setChatMessages(prev => [...prev, aiMessage]);
       }
@@ -776,19 +785,19 @@ const Dashboard = () => {
           const rescheduleDescription = `Please reschedule these events to avoid conflicts: ${overlapEvents.map(event => event.title).join(', ')}`;
           const result = await getAISuggestions(rescheduleDescription, 'Reschedule to avoid conflicts');
           
-          if (result.success && result.action === 'create_event') {
-            // Event was created successfully
+          if (result.success && result.actions && result.actions.length > 0) {
+            // Actions were performed successfully
             const newAiMessage = {
               id: Date.now() + 2,
               type: 'ai',
-              content: result.message
+              content: result.aiMessage
             };
             setChatMessages(prev => [...prev, newAiMessage]);
           } else {
             const errorMessage = {
               id: Date.now() + 2,
               type: 'ai',
-              content: result.message || "I'm having trouble finding a conflict-free time. Could you try specifying a different date or time preference?"
+              content: result.aiMessage || "I'm having trouble finding a conflict-free time. Could you try specifying a different date or time preference?"
             };
             setChatMessages(prev => [...prev, errorMessage]);
           }
@@ -848,6 +857,37 @@ const Dashboard = () => {
       };
       setChatMessages(prev => [...prev, errorMessage]);
     }
+  };
+
+  const handleConfirmActions = async (actions, actionResults) => {
+    try {
+      await confirmAIAction(actions, actionResults);
+      
+      const confirmationMessage = {
+        id: Date.now() + 1,
+        type: 'ai',
+        content: "✅ All actions have been confirmed and executed successfully!"
+      };
+      setChatMessages(prev => [...prev, confirmationMessage]);
+    } catch (error) {
+      console.error('❌ [DASHBOARD] Error confirming actions:', error);
+      
+      const errorMessage = {
+        id: Date.now() + 1,
+        type: 'ai',
+        content: "❌ Failed to confirm actions. Please try again or contact support if the issue persists."
+      };
+      setChatMessages(prev => [...prev, errorMessage]);
+    }
+  };
+
+  const handleCancelActions = () => {
+    const cancelMessage = {
+      id: Date.now() + 1,
+      type: 'ai',
+      content: "❌ Actions have been cancelled. No changes were made to your calendar."
+    };
+    setChatMessages(prev => [...prev, cancelMessage]);
   };
 
   const createEventFromSuggestion = async (suggestion) => {
@@ -1172,6 +1212,27 @@ const Dashboard = () => {
                         </div>
                       </div>
                     )}
+                    
+                    {/* Action confirmation buttons */}
+                    {message.requiresConfirmation && message.actions && message.actionResults && (
+                      <div className="mt-3 space-y-2">
+                        <div className="text-xs text-gray-500 mb-2">Please confirm these actions:</div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => handleConfirmActions(message.actions, message.actionResults)}
+                            className="px-3 py-1 bg-green-100 text-green-700 rounded text-xs hover:bg-green-200 transition-colors"
+                          >
+                            ✅ Confirm All
+                          </button>
+                          <button
+                            onClick={() => handleCancelActions()}
+                            className="px-3 py-1 bg-red-100 text-red-700 rounded text-xs hover:bg-red-200 transition-colors"
+                          >
+                            ❌ Cancel All
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))
@@ -1205,6 +1266,15 @@ const Dashboard = () => {
               className="px-2 py-1 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               <Send className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
+              onClick={() => fetchEvents()}
+              disabled={loading}
+              className="px-2 py-1 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50 transition-colors"
+              title="Refresh Events"
+            >
+              🔄
             </button>
             {pomodoroState === 'idle' && (
               <button

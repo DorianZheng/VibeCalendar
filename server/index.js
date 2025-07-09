@@ -34,7 +34,27 @@ const detectLanguage = (text) => {
 // Action handlers registry - easily extensible for future actions
 const actionHandlers = {
   'create_event': { 
-    description: "Create new events (meetings, appointments, reminders, etc.)",
+    description: "Create a new event.",
+    parameters: {
+      event: {
+        required: true,
+        fields: {
+          title:        { required: true,  desc: "Event title" },
+          startTime:    { required: true,  desc: "Start time (ISO)" },
+          endTime:      { required: true,  desc: "End time (ISO)" },
+          description:  { required: false, desc: "Event details" },
+          location:     { required: false, desc: "Event location" },
+          attendees:    { required: false, desc: "Attendee emails" },
+          reminders:    { required: false, desc: "Reminders" },
+          timezone:     { required: false, desc: "Timezone" }
+        }
+      }
+    },
+    returns: {
+      success: { desc: "Action success status" },
+      event: { desc: "Created event data" },
+      message: { desc: "User message" }
+    },
     handler: async (parameters, sessionId, oauth2Client) => {
       const { event } = parameters;
       if (!event || !event.title || !event.startTime || !event.endTime) {
@@ -83,7 +103,23 @@ const actionHandlers = {
   },
   
   'query_events': { 
-    description: "Search and display existing events",
+    description: "Search and display events.",
+    parameters: {
+      criteria: {
+        required: true,
+        fields: {
+          startDate:   { required: false, desc: "Start date (ISO)" },
+          endDate:     { required: false, desc: "End date (ISO)" },
+          searchTerm:  { required: false, desc: "Search keyword" }
+        }
+      }
+    },
+    returns: {
+      success: { desc: "Action success status" },
+      events: { desc: "Found events array" },
+      count: { desc: "Event count" },
+      message: { desc: "User message" }
+    },
     handler: async (parameters, sessionId, oauth2Client) => {
       const { criteria = {} } = parameters;
       const { startDate, endDate, searchTerm } = criteria;
@@ -112,7 +148,28 @@ const actionHandlers = {
   },
   
   'update_event': { 
-    description: "Modify existing events (requires user confirmation)",
+    description: "Update an event (confirmation required).",
+    parameters: {
+      eventId: { required: true, desc: "ID of event to update" },
+      event: {
+        required: true,
+        fields: {
+          title:        { required: false, desc: "New title" },
+          startTime:    { required: false, desc: "New start time (ISO)" },
+          endTime:      { required: false, desc: "New end time (ISO)" },
+          description:  { required: false, desc: "New details" },
+          location:     { required: false, desc: "New location" },
+          attendees:    { required: false, desc: "New attendee emails" },
+          reminders:    { required: false, desc: "New reminders" },
+          timezone:     { required: false, desc: "New timezone" }
+        }
+      }
+    },
+    returns: {
+      success: { desc: "Action success status" },
+      event: { desc: "Updated event data" },
+      message: { desc: "User message" }
+    },
     handler: async (parameters, sessionId, oauth2Client) => {
       const { eventId, event } = parameters;
       if (!eventId || !event) {
@@ -161,7 +218,15 @@ const actionHandlers = {
   },
   
   'delete_event': { 
-    description: "Remove events (requires user confirmation)",
+    description: "Delete an event (confirmation required).",
+    parameters: {
+      eventId:    { required: true, desc: "ID of event to delete" },
+      eventTitle: { required: false, desc: "Title for confirmation" }
+    },
+    returns: {
+      success: { desc: "Action success status" },
+      message: { desc: "User message" }
+    },
     handler: async (parameters, sessionId, oauth2Client) => {
       const { eventId, eventTitle } = parameters;
       if (!eventId) {
@@ -192,6 +257,34 @@ const actionHandlers = {
   //   requiresConfirmation: false // or true if destructive
   // }
 };
+
+// Generate concise action/parameter prompt for the AI
+function generateActionParameterPrompt() {
+  let out = 'ACTIONS:';
+  for (const [action, def] of Object.entries(actionHandlers)) {
+    out += `\n- ${action}: ${def.description}`;
+    if (def.parameters) {
+      out += '\n  Input parameters:';
+      for (const [param, meta] of Object.entries(def.parameters)) {
+        if (meta.fields) {
+          out += `\n    ${param} (object${meta.required ? ', required' : ''}):`;
+          for (const [field, fmeta] of Object.entries(meta.fields)) {
+            out += `\n      - ${field} (${fmeta.required ? 'required' : 'optional'}): ${fmeta.desc}`;
+          }
+        } else {
+          out += `\n    ${param} (${meta.required ? 'required' : 'optional'}): ${meta.desc}`;
+        }
+      }
+    }
+    if (def.returns) {
+      out += '\n  Returns:';
+      for (const [field, meta] of Object.entries(def.returns)) {
+        out += `\n    ${field}: ${meta.desc}`;
+      }
+    }
+  }
+  return out;
+}
 
 // Generate action descriptions for AI prompt
 const generateActionDescriptions = () => {
@@ -354,7 +447,7 @@ process.on('SIGINT', async () => {
   await saveSessions();
   server.close(() => {
     console.log('✅ [SERVER] Server closed');
-    process.exit(0);
+  process.exit(0);
   });
 });
 
@@ -363,7 +456,7 @@ process.on('SIGTERM', async () => {
   await saveSessions();
   server.close(() => {
     console.log('✅ [SERVER] Server closed');
-    process.exit(0);
+  process.exit(0);
   });
 });
 
@@ -427,7 +520,7 @@ async function geminiGenerateContent({ model, prompt, retryCount = 0 }) {
   });
   
   try {
-    const response = await axios.post(url, body, options);
+  const response = await axios.post(url, body, options);
     console.log('✅ [SERVER] Gemini API request successful:', {
       status: response.status,
       statusText: response.statusText,
@@ -435,7 +528,7 @@ async function geminiGenerateContent({ model, prompt, retryCount = 0 }) {
       retryCount: retryCount,
       timestamp: new Date().toISOString()
     });
-    return response.data;
+  return response.data;
   } catch (error) {
     console.error('❌ [SERVER] Gemini API request failed:', {
       error: error.message,
@@ -497,6 +590,91 @@ const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_SECRET,
   process.env.GOOGLE_REDIRECT_URI
 );
+
+// Store active watch subscriptions
+const watchSubscriptions = new Map();
+
+// Google Calendar Watch API setup
+const setupCalendarWatch = async (sessionId, oauth2Client) => {
+  try {
+    console.log('🔄 [SERVER] Setting up Google Calendar watch for session:', sessionId.substring(0, 8) + '...');
+    
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    
+    // Create a unique webhook URL for this session
+    const webhookUrl = `${process.env.CLIENT_URL || 'http://localhost:3000'}/api/calendar/webhook/${sessionId}`;
+    
+    const watchRequest = {
+      id: `vibe-calendar-${sessionId}`,
+      type: 'web_hook',
+      address: webhookUrl,
+      params: {
+        ttl: '604800' // 7 days in seconds
+      }
+    };
+    
+    const response = await calendar.events.watch({
+      calendarId: 'primary',
+      resource: watchRequest
+    });
+    
+    // Store the subscription
+    watchSubscriptions.set(sessionId, {
+      subscriptionId: response.data.id,
+      resourceId: response.data.resourceId,
+      expiration: response.data.expiration,
+      webhookUrl
+    });
+    
+    console.log('✅ [SERVER] Google Calendar watch setup successful:', {
+      sessionId: sessionId.substring(0, 8) + '...',
+      subscriptionId: response.data.id,
+      expiration: response.data.expiration
+    });
+    
+    return response.data;
+  } catch (error) {
+    console.error('❌ [SERVER] Failed to setup Google Calendar watch:', {
+      sessionId: sessionId.substring(0, 8) + '...',
+      error: error.message,
+      status: error.code
+    });
+    return null;
+  }
+};
+
+// Stop watching calendar
+const stopCalendarWatch = async (sessionId) => {
+  try {
+    const subscription = watchSubscriptions.get(sessionId);
+    if (!subscription) {
+      console.log('⚠️ [SERVER] No active watch subscription found for session:', sessionId.substring(0, 8) + '...');
+      return;
+    }
+    
+    console.log('🔄 [SERVER] Stopping Google Calendar watch for session:', sessionId.substring(0, 8) + '...');
+    
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    
+    await calendar.channels.stop({
+      resource: {
+        id: subscription.subscriptionId,
+        resourceId: subscription.resourceId
+      }
+    });
+    
+    watchSubscriptions.delete(sessionId);
+    
+    console.log('✅ [SERVER] Google Calendar watch stopped successfully:', {
+      sessionId: sessionId.substring(0, 8) + '...'
+    });
+  } catch (error) {
+    console.error('❌ [SERVER] Failed to stop Google Calendar watch:', {
+      sessionId: sessionId.substring(0, 8) + '...',
+      error: error.message
+    });
+  }
+};
 
 // Authentication middleware
 const requireAuth = async (req, res, next) => {
@@ -594,13 +772,13 @@ app.get('/api/auth/session', async (req, res) => {
       }
     } catch (error) {
       console.error('❌ [SERVER] Token refresh failed during validation:', error.message);
-      sessions.delete(sessionId);
-      await saveSessions();
-      
-      return res.json({
-        valid: false,
-        message: 'Session expired'
-      });
+    sessions.delete(sessionId);
+    await saveSessions();
+    
+    return res.json({
+      valid: false,
+      message: 'Session expired'
+    });
     }
   }
   
@@ -736,6 +914,16 @@ app.get('/api/auth/google/callback', async (req, res) => {
       expiresIn: tokens.expires_in
     });
     
+    // Setup Google Calendar watch for real-time notifications
+    try {
+      await setupCalendarWatch(sessionId, oauth2Client);
+    } catch (watchError) {
+      console.log('⚠️ [SERVER] Watch setup failed, but continuing:', {
+        sessionId: sessionId.substring(0, 8) + '...',
+        error: watchError.message
+      });
+    }
+    
     // Redirect to frontend with session ID
     const frontendUrl = process.env.CLIENT_URL || 'http://localhost:30001';
     res.redirect(`${frontendUrl}?sessionId=${sessionId}`);
@@ -760,6 +948,16 @@ app.post('/api/auth/logout', async (req, res) => {
   });
   
   if (sessionId && sessions.has(sessionId)) {
+    // Stop Google Calendar watch before removing session
+    try {
+      await stopCalendarWatch(sessionId);
+    } catch (watchError) {
+      console.log('⚠️ [SERVER] Watch cleanup failed, but continuing:', {
+        sessionId: sessionId.substring(0, 8) + '...',
+        error: watchError.message
+      });
+    }
+    
     sessions.delete(sessionId);
     await saveSessions();
     
@@ -985,8 +1183,14 @@ app.post('/api/ai/schedule', aiLimiter, requireAuth, async (req, res) => {
     // Get user's calendar events for context
     let calendarContext = '';
     if (existingEvents && existingEvents.length > 0) {
+      console.log('📅 [SERVER] Available events for context:', existingEvents.map(event => ({
+        id: event.id,
+        summary: event.summary,
+        start: event.start.dateTime || event.start.date
+      })));
+      
       calendarContext = `Existing events: ${existingEvents.map(event => 
-        `${event.summary} on ${event.start.dateTime || event.start.date}`
+        `ID: ${event.id}, Title: ${event.summary}, Time: ${event.start.dateTime || event.start.date}`
       ).join(', ')}`;
     }
     
@@ -1064,14 +1268,24 @@ Current time: ${currentTimeInUserTZ}
 ${calendarContext ? `Calendar context: ${calendarContext}` : ''}
 
 AVAILABLE ACTIONS:
-${generateActionDescriptions()}
+${generateActionParameterPrompt()}
 
 RESPONSE FORMAT:
 You must respond with ONLY a JSON object in this exact format:
 {
-  "action": "action_name" or "none",
-  "message": "Your response to the user",
-  "parameters": { /* only if action is not "none" */ }
+  "actions": [
+    {
+      "action": "action_name",
+      "parameters": { /* action parameters */ }
+    }
+  ],
+  "message": "Your response to the user"
+}
+
+OR for no actions:
+{
+  "actions": [],
+  "message": "Your response to the user"
 }
 
 IMPORTANT: Respond with ONLY the JSON object, no additional text before or after.
@@ -1133,50 +1347,83 @@ RULES:
       aiResponseData = JSON.parse(cleanResponse);
       
       console.log('✅ [SERVER] AI response parsed successfully:', {
-        action: aiResponseData.action,
+        actions: aiResponseData.actions?.length || 0,
         hasMessage: !!aiResponseData.message,
-        hasParameters: !!aiResponseData.parameters,
-        parameters: aiResponseData.parameters
+        actionsList: aiResponseData.actions?.map(a => a.action) || []
       });
       
-      // Process the action if one was requested
-      if (aiResponseData.action && aiResponseData.action !== 'none') {
-        console.log('🔄 [SERVER] Processing AI action:', {
-          action: aiResponseData.action,
-          parameters: aiResponseData.parameters
+      // Process multiple actions if requested
+      if (aiResponseData.actions && aiResponseData.actions.length > 0) {
+        console.log('🔄 [SERVER] Processing AI actions:', {
+          actionCount: aiResponseData.actions.length,
+          actions: aiResponseData.actions.map(a => a.action)
         });
         
-        const actionResult = await processAction(
-          aiResponseData.action, 
-          aiResponseData.parameters, 
-          sessionId, 
-          oauth2Client
-        );
+        const actionResults = [];
+        let requiresConfirmation = false;
         
-        console.log('✅ [SERVER] Action processed:', {
-          action: aiResponseData.action,
-          success: actionResult.success,
-          requiresConfirmation: actionResult.requiresConfirmation,
-          message: actionResult.message
-        });
+        // Process each action sequentially
+        for (const actionRequest of aiResponseData.actions) {
+          try {
+            const actionResult = await processAction(
+              actionRequest.action, 
+              actionRequest.parameters, 
+              sessionId, 
+              oauth2Client
+            );
+            
+            actionResults.push({
+              action: actionRequest.action,
+              parameters: actionRequest.parameters,
+              success: actionResult.success,
+              message: actionResult.message,
+              requiresConfirmation: actionResult.requiresConfirmation
+            });
+            
+            // If any action requires confirmation, mark the whole response as requiring confirmation
+            if (actionResult.requiresConfirmation) {
+              requiresConfirmation = true;
+            }
+            
+            console.log('✅ [SERVER] Action processed:', {
+              action: actionRequest.action,
+              success: actionResult.success,
+              requiresConfirmation: actionResult.requiresConfirmation,
+              message: actionResult.message
+            });
+          } catch (error) {
+            console.error('❌ [SERVER] Action failed:', {
+              action: actionRequest.action,
+              error: error.message
+            });
+            
+            actionResults.push({
+              action: actionRequest.action,
+              parameters: actionRequest.parameters,
+              success: false,
+              message: `Failed to ${actionRequest.action}: ${error.message}`,
+              requiresConfirmation: false
+            });
+          }
+        }
         
-        // Return the action result along with AI's message
+        // Return all action results along with AI's message
         return res.json({
           success: true,
           aiMessage: aiResponseData.message,
-          action: aiResponseData.action,
-          actionResult: actionResult,
-          requiresConfirmation: actionResult.requiresConfirmation
+          actions: aiResponseData.actions.map(a => a.action),
+          actionResults: actionResults,
+          requiresConfirmation: requiresConfirmation
         });
       } else {
         // Just chatting - return AI's message
-        console.log('💬 [SERVER] AI is just chatting, no action requested');
+        console.log('💬 [SERVER] AI is just chatting, no actions requested');
         
         return res.json({
           success: true,
           aiMessage: aiResponseData.message,
-          action: 'none',
-          actionResult: null,
+          actions: [],
+          actionResults: [],
           requiresConfirmation: false
         });
       }
@@ -1431,7 +1678,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
       errorResponseData: error.response?.data,
       errorStack: error.stack,
       requestData: {
-        title,
+      title,
         description: description?.substring(0, 50) + (description?.length > 50 ? '...' : ''),
         startTime,
         endTime,
@@ -1615,17 +1862,17 @@ Select the best time slot and provide reasoning. Respond in JSON format:
     
     res.json(response);
     
-  } catch (error) {
-    console.error('❌ [SERVER] Smart scheduling error:', {
+      } catch (error) {
+      console.error('❌ [SERVER] Smart scheduling error:', {
       requestId,
-      error: error.message,
+        error: error.message,
       errorStack: error.stack,
       errorCode: error.code,
       errorStatus: error.status,
-      sessionId: sessionId.substring(0, 8) + '...',
+        sessionId: sessionId.substring(0, 8) + '...',
       ip: req.ip,
       timestamp: new Date().toISOString()
-    });
+      });
       
       // Provide more specific error messages based on the error type
       let errorMessage = 'Failed to perform smart scheduling';
@@ -1913,7 +2160,7 @@ Suggest optimal Pomodoro strategy:`;
     });
     
     res.json(fallbackSuggestion);
-  }
+    }
 });
 
 // Update calendar event
@@ -1994,6 +2241,53 @@ app.put('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
       ip: req.ip
     });
     res.status(500).json({ error: 'Failed to update calendar event' });
+  }
+});
+
+// Google Calendar webhook endpoint for real-time notifications
+app.post('/api/calendar/webhook/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  
+  console.log('🔄 [SERVER] Received Google Calendar webhook:', {
+    sessionId: sessionId.substring(0, 8) + '...',
+    headers: req.headers,
+    body: req.body,
+    ip: req.ip
+  });
+  
+  try {
+    // Verify this is a valid Google Calendar webhook
+    const subscription = watchSubscriptions.get(sessionId);
+    if (!subscription) {
+      console.log('⚠️ [SERVER] No active subscription found for webhook:', sessionId.substring(0, 8) + '...');
+      return res.status(404).json({ error: 'Subscription not found' });
+    }
+    
+    // Handle different types of notifications
+    const { state, resourceId, resourceUri } = req.body;
+    
+    if (state === 'exists') {
+      // Calendar events have changed, notify connected clients
+      console.log('📅 [SERVER] Calendar events changed, notifying clients:', {
+        sessionId: sessionId.substring(0, 8) + '...',
+        resourceId,
+        resourceUri
+      });
+      
+      // Here you would typically send a WebSocket message to connected clients
+      // For now, we'll just log the change
+      console.log('🔄 [SERVER] Calendar events updated, clients should refresh');
+    }
+    
+    // Always respond with 200 to acknowledge receipt
+    res.status(200).json({ received: true });
+    
+  } catch (error) {
+    console.error('❌ [SERVER] Webhook processing error:', {
+      sessionId: sessionId.substring(0, 8) + '...',
+      error: error.message
+    });
+    res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 
