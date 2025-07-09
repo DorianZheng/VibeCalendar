@@ -473,7 +473,7 @@ const testGeminiConnection = async () => {
   }
   try {
     console.log('🔄 [SERVER] Testing Google Gemini API connection...');
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt: 'Hello' });
+    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt: 'Hello' });
     if (data && data.candidates) {
       console.log('✅ [SERVER] Google Gemini API connection successful');
     } else {
@@ -649,7 +649,7 @@ app.get('/api/health/ai', async (req, res) => {
   
   try {
     console.log('🔄 [SERVER] Testing Gemini API connection...');
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt: 'Hello, this is a test message.' });
+    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt: 'Hello, this is a test message.' });
     
     console.log('✅ [SERVER] AI health check successful');
     res.json({
@@ -946,7 +946,8 @@ app.post('/api/ai/schedule', aiLimiter, requireAuth, async (req, res) => {
     description: description ? description.substring(0, 50) + '...' : 'none',
     preferences: preferences ? preferences.substring(0, 50) + '...' : 'none',
     existingEventsCount: existingEvents?.length || 0,
-    ip: req.ip
+    ip: req.ip,
+    timestamp: new Date().toISOString()
   });
   
   // Check if Gemini API key is configured
@@ -1086,12 +1087,12 @@ RULES:
 
     console.log('🤖 [SERVER] Making Google Gemini API call...', {
       promptLength: prompt.length,
-      model: "gemini-2.0-flash",
+      model: "gemini-2.0-flash-exp",
       detectedLanguage: detectedLanguage,
       userInput: description.substring(0, 50) + '...'
     });
 
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt });
+    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt });
     
     const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     
@@ -1526,12 +1527,12 @@ Select the best time slot and provide reasoning. Respond in JSON format:
       promptLength: prompt.length,
       promptPreview: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : ''),
       fullPrompt: prompt,
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.0-flash-exp',
       timeSlotsCount: timeSlots.length
     });
 
     const aiStartTime = Date.now();
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt });
+    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt });
     const aiEndTime = Date.now();
     const responseTime = aiEndTime - aiStartTime;
     
@@ -1778,12 +1779,12 @@ Suggest optimal Pomodoro strategy:`;
     promptLength: prompt.length,
     promptPreview: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : ''),
     isInitialized: !initializeSession,
-    model: 'gemini-2.0-flash'
+    model: 'gemini-2.0-flash-exp'
   });
   
   try {
     const aiStartTime = Date.now();
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt });
+    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt });
     const aiEndTime = Date.now();
     const responseTime = aiEndTime - aiStartTime;
     
