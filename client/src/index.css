@@ -22,7 +22,7 @@
   }
   
   .card {
-    @apply bg-white rounded-xl shadow-sm border border-gray-200 p-6;
+    @apply bg-white rounded-xl shadow-sm border border-gray-200 p-3;
   }
   
   .input-field {
@@ -47,6 +47,22 @@
   
   .ai-suggestion {
     @apply bg-gradient-to-r from-purple-50 to-blue-50 border border-purple-200 rounded-lg p-4;
+  }
+  
+  .chat-message {
+    @apply max-w-[85%] px-3 py-2 rounded-lg text-xs leading-relaxed;
+  }
+  
+  .chat-message.user {
+    @apply bg-primary-600 text-white;
+  }
+  
+  .chat-message.ai {
+    @apply bg-gray-100 text-gray-900;
+  }
+  
+  .chat-message.ai strong {
+    @apply text-gray-900 font-semibold;
   }
 }
 

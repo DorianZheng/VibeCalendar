@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Brain, Calendar, Clock, MapPin, Users, CheckCircle, Sparkles } from 'lucide-react';
 import { useCalendar } from '../context/CalendarContext';
 import { format } from 'date-fns';
+import toast from 'react-hot-toast';
 
 const AIScheduler = () => {
   const { getAISuggestions, createEvent, aiSuggestions, loading } = useCalendar();
@@ -15,7 +16,7 @@ const AIScheduler = () => {
     location: ''
   });
 
-  const [suggestion, setSuggestion] = useState(null);
+  const [suggestions, setSuggestions] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
 
   const handleInputChange = (e) => {
@@ -41,7 +42,11 @@ Preferences: ${formData.preferences}
       `.trim();
 
       const result = await getAISuggestions(fullDescription, formData.preferences);
-      setSuggestion(result);
+      if (result.shouldSchedule && result.events) {
+        setSuggestions(result.events);
+      } else {
+        setSuggestions([]);
+      }
     } catch (error) {
       console.error('Error getting AI suggestion:', error);
     } finally {
@@ -49,109 +54,166 @@ Preferences: ${formData.preferences}
     }
   };
 
-  const handleCreateEvent = async (suggestionData) => {
+  const handleAcceptEvents = async () => {
     try {
-      const eventData = {
-        title: suggestionData.title,
-        description: suggestionData.description,
-        startTime: suggestionData.suggestedTime,
-        endTime: new Date(new Date(suggestionData.suggestedTime).getTime() + 
-          parseInt(suggestionData.duration.split(':')[0]) * 60 * 60 * 1000 + 
-          parseInt(suggestionData.duration.split(':')[1]) * 60 * 1000).toISOString(),
-        location: suggestionData.location,
-        attendees: suggestionData.attendees
-      };
+      let successCount = 0;
+      let errorCount = 0;
+      
+      for (const event of suggestions) {
+        try {
+          const eventData = {
+            title: event.title,
+            description: event.description,
+            startTime: event.suggestedTime,
+            endTime: event.endTime || new Date(new Date(event.suggestedTime).getTime() + 
+              parseInt(event.duration.split(':')[0]) * 60 * 60 * 1000 + 
+              parseInt(event.duration.split(':')[1]) * 60 * 1000).toISOString(),
+            location: event.location,
+            attendees: event.attendees,
+            multiDay: event.multiDay || false,
+            recurring: event.recurring || false
+          };
 
-      await createEvent(eventData);
-      setSuggestion(null);
-      setFormData({
-        description: '',
-        preferences: '',
-        duration: '60',
-        priority: 'medium',
-        attendees: '',
-        location: ''
-      });
+          await createEvent(eventData);
+          successCount++;
+        } catch (eventError) {
+          console.error('Error creating event:', event.title, eventError);
+          errorCount++;
+        }
+      }
+      
+      // Show appropriate message based on results
+      if (successCount > 0 && errorCount === 0) {
+        // All events created successfully
+        toast.success(`All ${successCount} event(s) have been added to your Google Calendar!`);
+        setSuggestions([]);
+        setFormData({
+          description: '',
+          preferences: '',
+          duration: '60',
+          priority: 'medium',
+          attendees: '',
+          location: ''
+        });
+      } else if (successCount > 0 && errorCount > 0) {
+        // Some events created, some failed
+        toast.error(`Created ${successCount} event(s), but ${errorCount} failed. Please try again for the failed events.`);
+      } else {
+        // All events failed
+        toast.error('Oops! I ran into a little issue creating your event(s). Don\'t worry though - you can try again, or let me know if you\'d like to adjust anything! 😊');
+      }
     } catch (error) {
-      console.error('Error creating event:', error);
+      console.error('Error in handleAcceptEvents:', error);
+      toast.error('Oops! I ran into a little issue creating your event(s). Don\'t worry though - you can try again, or let me know if you\'d like to adjust anything! 😊');
     }
   };
 
   const examplePrompts = [
     "Team meeting to discuss Q4 strategy",
     "Client presentation for the new product launch",
-    "Coffee catch-up with Sarah from marketing",
-    "Weekly standup with the development team",
-    "Doctor appointment for annual checkup"
+    "Schedule team meeting and client call tomorrow",
+    "Daily standup meetings this week",
+    "3-day conference next week",
+    "Weekly team meetings for the next month",
+    "Schedule morning standup and afternoon review meeting",
+    "明天下午2点开会",
+    "安排本周的每日站会",
+    "下周安排三天会议",
+    "Programar reunión mañana",
+    "Programar reuniones diarias esta semana"
   ];
 
-  const SuggestionCard = ({ suggestion }) => (
-    <div className="ai-suggestion animate-fade-in">
+  const SuggestionsList = ({ suggestions }) => (
+    <div className="space-y-6">
       <div className="flex items-center space-x-2 mb-4">
         <Sparkles className="h-5 w-5 text-purple-600" />
-        <h3 className="font-semibold text-purple-900">AI Suggestion</h3>
+        <h3 className="font-semibold text-purple-900">AI Suggestions ({suggestions.length} event{suggestions.length !== 1 ? 's' : ''})</h3>
       </div>
       
-      <div className="space-y-4">
-        <div>
-          <h4 className="font-medium text-gray-900 mb-2">{suggestion.title}</h4>
-          <p className="text-sm text-gray-600">{suggestion.description}</p>
-        </div>
-        
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="flex items-center space-x-2">
-            <Calendar className="h-4 w-4 text-gray-400" />
-            <span className="text-sm text-gray-600">
-              {format(new Date(suggestion.suggestedTime), 'EEEE, MMMM d, yyyy')}
-            </span>
-          </div>
-          
-          <div className="flex items-center space-x-2">
-            <Clock className="h-4 w-4 text-gray-400" />
-            <span className="text-sm text-gray-600">
-              {format(new Date(suggestion.suggestedTime), 'h:mm a')} ({suggestion.duration})
-            </span>
-          </div>
-          
-          {suggestion.location && (
-            <div className="flex items-center space-x-2">
-              <MapPin className="h-4 w-4 text-gray-400" />
-              <span className="text-sm text-gray-600">{suggestion.location}</span>
+      {suggestions.map((suggestion, index) => (
+        <div key={index} className="ai-suggestion animate-fade-in border border-gray-200 rounded-lg p-4">
+          <div className="space-y-4">
+            <div>
+              <div className="flex items-center space-x-2 mb-2">
+                <h4 className="font-medium text-gray-900">{suggestion.title}</h4>
+                {suggestion.recurring && (
+                  <span className="px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded-full">Recurring</span>
+                )}
+                {suggestion.multiDay && (
+                  <span className="px-2 py-1 text-xs bg-green-100 text-green-800 rounded-full">Multi-day</span>
+                )}
+              </div>
+              <p className="text-sm text-gray-600">{suggestion.description}</p>
             </div>
-          )}
-          
-          {suggestion.attendees && suggestion.attendees.length > 0 && (
-            <div className="flex items-center space-x-2">
-              <Users className="h-4 w-4 text-gray-400" />
-              <span className="text-sm text-gray-600">
-                {suggestion.attendees.length} attendee{suggestion.attendees.length !== 1 ? 's' : ''}
-              </span>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="flex items-center space-x-2">
+                <Calendar className="h-4 w-4 text-gray-400" />
+                <span className="text-sm text-gray-600">
+                  {suggestion.multiDay && suggestion.endTime ? (
+                    <>
+                      {format(new Date(suggestion.suggestedTime), 'MMM d')} - {format(new Date(suggestion.endTime), 'MMM d, yyyy')}
+                    </>
+                  ) : (
+                    format(new Date(suggestion.suggestedTime), 'EEEE, MMMM d, yyyy')
+                  )}
+                </span>
+              </div>
+              
+              <div className="flex items-center space-x-2">
+                <Clock className="h-4 w-4 text-gray-400" />
+                <span className="text-sm text-gray-600">
+                  {suggestion.multiDay ? (
+                    'Multi-day event'
+                  ) : (
+                    <>
+                      {format(new Date(suggestion.suggestedTime), 'h:mm a')} ({suggestion.duration})
+                    </>
+                  )}
+                </span>
+              </div>
+              
+              {suggestion.location && (
+                <div className="flex items-center space-x-2">
+                  <MapPin className="h-4 w-4 text-gray-400" />
+                  <span className="text-sm text-gray-600">{suggestion.location}</span>
+                </div>
+              )}
+              
+              {suggestion.attendees && suggestion.attendees.length > 0 && (
+                <div className="flex items-center space-x-2">
+                  <Users className="h-4 w-4 text-gray-400" />
+                  <span className="text-sm text-gray-600">
+                    {suggestion.attendees.length} attendee{suggestion.attendees.length !== 1 ? 's' : ''}
+                  </span>
+                </div>
+              )}
             </div>
-          )}
+            
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <p className="text-sm text-blue-800">
+                <strong>Reasoning:</strong> {suggestion.reasoning}
+              </p>
+            </div>
+          </div>
         </div>
+      ))}
+      
+      <div className="flex space-x-3">
+        <button
+          onClick={handleAcceptEvents}
+          className="btn-primary flex items-center space-x-2"
+        >
+          <CheckCircle className="h-4 w-4" />
+          <span>Accept All Events</span>
+        </button>
         
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-          <p className="text-sm text-blue-800">
-            <strong>Reasoning:</strong> {suggestion.reasoning}
-          </p>
-        </div>
-        
-        <div className="flex space-x-3">
-          <button
-            onClick={() => handleCreateEvent(suggestion)}
-            className="btn-primary flex items-center space-x-2"
-          >
-            <CheckCircle className="h-4 w-4" />
-            <span>Create Event</span>
-          </button>
-          
-          <button
-            onClick={() => setSuggestion(null)}
-            className="btn-secondary"
-          >
-            Try Again
-          </button>
-        </div>
+        <button
+          onClick={() => setSuggestions([])}
+          className="btn-secondary"
+        >
+          Try Again
+        </button>
       </div>
     </div>
   );
@@ -165,7 +227,7 @@ Preferences: ${formData.preferences}
             </div>
             <div>
               <h1 className="text-3xl font-bold text-gray-900">AI Scheduler</h1>
-              <p className="text-gray-600">Describe your event and let Google Gemini AI find the perfect time</p>
+              <p className="text-gray-600">Describe your events and let Google Gemini AI find the perfect times</p>
             </div>
           </div>
 
@@ -178,13 +240,13 @@ Preferences: ${formData.preferences}
             <form onSubmit={handleSubmit} className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Event Description *
+                  Event Description(s) *
                 </label>
                 <textarea
                   name="description"
                   value={formData.description}
                   onChange={handleInputChange}
-                  placeholder="Describe your event in natural language..."
+                  placeholder="Describe your event(s) in natural language..."
                   className="input-field h-24 resize-none"
                   required
                 />
@@ -303,13 +365,19 @@ Preferences: ${formData.preferences}
                 </button>
               ))}
             </div>
+            <div className="mt-4 p-3 bg-blue-50 rounded-lg">
+              <p className="text-xs text-blue-700">
+                <strong>New:</strong> Try multi-day events like "3-day conference" or recurring events like "daily standup meetings this week". 
+                The AI responds in your language - try Chinese, Spanish, or any language you prefer!
+              </p>
+            </div>
           </div>
         </div>
 
-        {/* AI Suggestion */}
+        {/* AI Suggestions */}
         <div className="space-y-6">
-          {suggestion ? (
-            <SuggestionCard suggestion={suggestion} />
+          {suggestions.length > 0 ? (
+            <SuggestionsList suggestions={suggestions} />
           ) : (
             <div className="card bg-gradient-to-br from-purple-50 to-blue-50 border-purple-200">
               <div className="text-center py-12">

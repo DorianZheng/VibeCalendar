@@ -151,7 +151,7 @@ npm start
 
 The application will be available at:
 - **Frontend**: http://localhost:3000
-- **Backend**: http://localhost:5000
+- **Backend**: http://localhost:5001
 
 ## 🎯 Usage Guide
 

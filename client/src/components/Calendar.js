@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { 
   ChevronLeft, 
@@ -37,10 +37,37 @@ const Calendar = () => {
   } = useCalendar();
 
   const [viewMode, setViewMode] = useState('month');
+  const [lastFetchDate, setLastFetchDate] = useState(null);
+
+  // Debounced fetch events to prevent excessive API calls
+  const debouncedFetchEvents = useCallback(async () => {
+    const now = new Date();
+    const lastFetch = lastFetchDate;
+    
+    // Only fetch if we haven't fetched in the last 30 seconds
+    if (!lastFetch || (now - lastFetch) > 30000) {
+      console.log('🔄 [CALENDAR] Fetching events for month:', format(currentDate, 'MMMM yyyy'));
+      setLastFetchDate(now);
+      await fetchEvents();
+    } else {
+      console.log('⏳ [CALENDAR] Skipping fetch - too soon since last request');
+    }
+  }, [fetchEvents, currentDate, lastFetchDate]);
 
   useEffect(() => {
-    fetchEvents();
-  }, [currentDate]);
+    // Only fetch if we have events and the month has changed significantly
+    if (events.length > 0) {
+      debouncedFetchEvents();
+    }
+  }, [debouncedFetchEvents]);
+
+  // Initial fetch when component mounts
+  useEffect(() => {
+    if (events.length === 0) {
+      console.log('🔄 [CALENDAR] Initial fetch for calendar view');
+      fetchEvents();
+    }
+  }, []); // Only run once on mount
 
   const goToPreviousMonth = () => {
     setCurrentDate(subMonths(currentDate, 1));
