@@ -291,11 +291,23 @@ const Dashboard = () => {
 
   // Pomodoro timer functions
   const startPomodoro = () => {
+    console.log('🍅 [CLIENT] Starting Pomodoro:', {
+      workDuration,
+      breakDuration,
+      pomodoroState,
+      isRunning,
+      timeLeft
+    });
+    
     setPomodoroState('work');
     setTimeLeft(workDuration * 60); // Use AI-determined work duration
     setIsRunning(true);
     setShowPomodoroSuggestion(false);
     setPomodoroSuggestion(null);
+    setShowPomodoroNotification(false); // Close notification if open
+    setPomodoroNotificationData(null);
+    
+    console.log('✅ [CLIENT] Pomodoro started successfully');
   };
 
   const pausePomodoro = () => {
@@ -575,12 +587,30 @@ const Dashboard = () => {
 
   // Pomodoro timer effect
   useEffect(() => {
+    console.log('⏰ [CLIENT] Pomodoro timer effect triggered:', {
+      isRunning,
+      pomodoroState,
+      workDuration,
+      breakDuration,
+      timeLeft,
+      hasInterval: !!pomodoroIntervalRef.current
+    });
+    
     if (isRunning) {
+      console.log('🔄 [CLIENT] Starting Pomodoro timer interval');
       pomodoroIntervalRef.current = setInterval(() => {
         setTimeLeft(prev => {
+          console.log('⏱️ [CLIENT] Timer tick:', {
+            currentTime: prev,
+            pomodoroState,
+            workDuration,
+            breakDuration
+          });
+          
           if (prev <= 1) {
             // Timer finished
             if (pomodoroState === 'work') {
+              console.log('✅ [CLIENT] Work session complete, starting break');
               setPomodoroState('break');
               setTimeLeft(breakDuration * 60); // Use AI-determined break duration
               // Play notification sound or show notification with user's language
@@ -598,6 +628,7 @@ const Dashboard = () => {
               const breakNotification = breakTexts[userLang] || breakTexts.en;
               showPomodoroBrowserNotification(breakNotification.title, breakNotification.message);
             } else {
+              console.log('✅ [CLIENT] Break complete, returning to idle');
               setPomodoroState('idle');
               setTimeLeft(workDuration * 60); // Use AI-determined work duration
               setIsRunning(false);
@@ -622,12 +653,14 @@ const Dashboard = () => {
       }, 1000);
     } else {
       if (pomodoroIntervalRef.current) {
+        console.log('⏹️ [CLIENT] Clearing Pomodoro timer interval');
         clearInterval(pomodoroIntervalRef.current);
       }
     }
 
     return () => {
       if (pomodoroIntervalRef.current) {
+        console.log('🧹 [CLIENT] Cleaning up Pomodoro timer interval');
         clearInterval(pomodoroIntervalRef.current);
       }
     };
@@ -654,50 +687,55 @@ const Dashboard = () => {
     setIsTyping(true);
 
     try {
-      // Get AI suggestion
-      const result = await getAISuggestions(inputMessage, 'User wants to schedule this event');
+      // Get AI suggestion - let the AI determine intent from the message itself
+      const result = await getAISuggestions(inputMessage, '');
       
       let aiMessage;
       
-      if (result.shouldSchedule === false) {
-        // AI determined no event should be scheduled
+      // Handle the new action-based response format
+      if (result.success && result.action === 'none') {
+        // AI is just chatting - show the message
         aiMessage = {
           id: Date.now() + 1,
           type: 'ai',
           content: result.message
         };
         setChatMessages(prev => [...prev, aiMessage]);
-      } else {
-        // AI determined events should be scheduled - automatically create them
-        const events = result.events || [result];
-        const eventCount = events.length;
-        
-        // Show initial suggestion message
-        let content = '';
-        if (eventCount === 1) {
-          const event = events[0];
-          content = `Perfect! I've found a great time for your event:\n\n📅 **${event.title}**\n⏰ **${format(new Date(event.suggestedTime), 'EEEE, MMMM d, yyyy')} at ${format(new Date(event.suggestedTime), 'h:mm a')}**\n⏱️ **Duration:** ${event.duration}\n${event.location ? `📍 **Location:** ${event.location}\n` : ''}${event.attendees && event.attendees.length > 0 ? `👥 **Attendees:** ${event.attendees.length} people\n` : ''}\n💭 **Why this time?** ${event.reasoning}\n\nAdding this to your calendar now... ✨`;
-        } else {
-          content = `Great! I've found ${eventCount} perfect times for your events:\n\n`;
-          events.forEach((event, index) => {
-            content += `**${index + 1}. ${event.title}**\n`;
-            content += `📅 ${format(new Date(event.suggestedTime), 'EEEE, MMMM d')} at ${format(new Date(event.suggestedTime), 'h:mm a')}\n`;
-            content += `⏱️ ${event.duration}`;
-            if (event.location) content += ` | 📍 ${event.location}`;
-            content += `\n💭 ${event.reasoning}\n\n`;
-          });
-          content += `Adding all ${eventCount} events to your calendar now... ✨`;
-        }
-        
+      } else if (result.success && result.action === 'create_event') {
+        // Event was created successfully
         aiMessage = {
           id: Date.now() + 1,
           type: 'ai',
-          content: content
+          content: result.message
         };
         setChatMessages(prev => [...prev, aiMessage]);
-        
-        // Automatically create the events
-        await createEventFromSuggestion(eventCount === 1 ? events[0] : events);
+      } else if (result.success && result.action === 'query_events') {
+        // Events were queried successfully
+        aiMessage = {
+          id: Date.now() + 1,
+          type: 'ai',
+          content: result.message
+        };
+        setChatMessages(prev => [...prev, aiMessage]);
+      } else if (result.success && (result.action === 'update_event' || result.action === 'delete_event')) {
+        // These actions require user confirmation
+        aiMessage = {
+          id: Date.now() + 1,
+          type: 'ai',
+          content: result.message,
+          requiresConfirmation: true,
+          action: result.action,
+          actionResult: result.actionResult
+        };
+        setChatMessages(prev => [...prev, aiMessage]);
+      } else {
+        // Action failed or error occurred
+        aiMessage = {
+          id: Date.now() + 1,
+          type: 'ai',
+          content: result.message || "I'm having trouble with that request. Could you try rephrasing it?"
+        };
+        setChatMessages(prev => [...prev, aiMessage]);
       }
     } catch (error) {
       const errorMessage = {
@@ -711,67 +749,262 @@ const Dashboard = () => {
     }
   };
 
+  const handleOverlapChoice = async (choice, overlapEvents, overlaps) => {
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+    
+    console.log('🔄 [DASHBOARD] Handling overlap choice:', {
+      requestId,
+      choice,
+      overlapEventsCount: overlapEvents?.length || 0,
+      overlapsCount: overlaps?.length || 0
+    });
+    
+    try {
+      let aiMessage;
+      
+      switch (choice) {
+        case 'reschedule':
+          // Ask AI to reschedule to different times
+          aiMessage = {
+            id: Date.now() + 1,
+            type: 'ai',
+            content: "I'll help you find a better time that doesn't conflict with your existing events. Let me look for alternative slots... 🔄"
+          };
+          setChatMessages(prev => [...prev, aiMessage]);
+          
+          // Create a new request to reschedule
+          const rescheduleDescription = `Please reschedule these events to avoid conflicts: ${overlapEvents.map(event => event.title).join(', ')}`;
+          const result = await getAISuggestions(rescheduleDescription, 'Reschedule to avoid conflicts');
+          
+          if (result.success && result.action === 'create_event') {
+            // Event was created successfully
+            const newAiMessage = {
+              id: Date.now() + 2,
+              type: 'ai',
+              content: result.message
+            };
+            setChatMessages(prev => [...prev, newAiMessage]);
+          } else {
+            const errorMessage = {
+              id: Date.now() + 2,
+              type: 'ai',
+              content: result.message || "I'm having trouble finding a conflict-free time. Could you try specifying a different date or time preference?"
+            };
+            setChatMessages(prev => [...prev, errorMessage]);
+          }
+          break;
+          
+        case 'cancel_conflicting':
+          // Cancel conflicting events and create new ones
+          aiMessage = {
+            id: Date.now() + 1,
+            type: 'ai',
+            content: "I'll cancel the conflicting events and create your new events. This will remove the overlapping events from your calendar. ⚠️"
+          };
+          setChatMessages(prev => [...prev, aiMessage]);
+          
+          // TODO: Implement event deletion functionality
+          // For now, just create the new events
+          await createEventFromSuggestion(overlapEvents);
+          
+          const successMessage = {
+            id: Date.now() + 2,
+            type: 'ai',
+            content: "✅ Your new events have been created! Note: You may need to manually delete the conflicting events from your calendar."
+          };
+          setChatMessages(prev => [...prev, successMessage]);
+          break;
+          
+        case 'create_anyway':
+          // Create overlapping events anyway
+          aiMessage = {
+            id: Date.now() + 1,
+            type: 'ai',
+            content: "Creating your events with the overlapping times. You'll have multiple events at the same time in your calendar. ⚠️"
+          };
+          setChatMessages(prev => [...prev, aiMessage]);
+          
+          await createEventFromSuggestion(overlapEvents);
+          
+          const createdMessage = {
+            id: Date.now() + 2,
+            type: 'ai',
+            content: "✅ Your events have been created! You now have overlapping events in your calendar."
+          };
+          setChatMessages(prev => [...prev, createdMessage]);
+          break;
+      }
+    } catch (error) {
+      console.error('❌ [DASHBOARD] Error handling overlap choice:', {
+        requestId,
+        choice,
+        error: error.message
+      });
+      
+      const errorMessage = {
+        id: Date.now() + 1,
+        type: 'ai',
+        content: "Sorry, I encountered an error while handling your choice. Please try again or let me know if you need help!"
+      };
+      setChatMessages(prev => [...prev, errorMessage]);
+    }
+  };
+
   const createEventFromSuggestion = async (suggestion) => {
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+    
+    console.log('🎯 [DASHBOARD] Starting event creation from suggestion:', {
+      requestId,
+      suggestionType: Array.isArray(suggestion) ? 'array' : 'single',
+      suggestionCount: Array.isArray(suggestion) ? suggestion.length : 1,
+      originalSuggestion: suggestion
+    });
+    
     try {
       const events = Array.isArray(suggestion) ? suggestion : [suggestion];
       const eventCount = events.length;
       
+      console.log('📋 [DASHBOARD] Processing events for creation:', {
+        requestId,
+        eventCount,
+        events: events.map((event, index) => ({
+          index: index + 1,
+          title: event.title,
+          startTime: event.startTime,
+          endTime: event.endTime,
+          description: event.description?.substring(0, 50) + '...',
+          location: event.location,
+          attendeesCount: event.attendees?.length || 0,
+          reminders: event.reminders
+        }))
+      });
+      
       let createdCount = 0;
       const createdEvents = [];
+      const failedEvents = [];
       
-      for (const event of events) {
-        const startTime = new Date(event.suggestedTime);
-        const [hours, minutes] = event.duration.split(':').map(Number);
-        const endTime = new Date(startTime.getTime() + (hours * 60 + minutes) * 60 * 1000);
-
-        const eventData = {
+      for (const [index, event] of events.entries()) {
+        console.log(`🔄 [DASHBOARD] Processing event ${index + 1}/${eventCount}:`, {
+          requestId,
+          eventIndex: index + 1,
           title: event.title,
-          description: event.description,
-          startTime: startTime.toISOString(),
-          endTime: endTime.toISOString(),
-          location: event.location,
-          attendees: event.attendees || [],
-          reminders: event.reminders || ['15 minutes before']
-        };
-
-        console.log('🔄 [DASHBOARD] Creating event with data:', {
-          title: eventData.title,
-          startTime: eventData.startTime,
-          endTime: eventData.endTime,
-          location: eventData.location,
-          attendeesCount: eventData.attendees.length,
-          reminders: eventData.reminders
+          startTime: event.startTime,
+          endTime: event.endTime
         });
+        
+        try {
+          // AI already provided startTime and endTime, so we can use them directly
+          const eventData = {
+            title: event.title,
+            description: event.description,
+            startTime: event.startTime,
+            endTime: event.endTime,
+            location: event.location,
+            attendees: event.attendees || [],
+            reminders: event.reminders || ['15 minutes before']
+          };
 
-        await createEvent(eventData);
-        createdCount++;
-        createdEvents.push(event.title);
+          console.log(`📝 [DASHBOARD] Event ${index + 1} data prepared:`, {
+            requestId,
+            eventIndex: index + 1,
+            title: eventData.title,
+            startTime: eventData.startTime,
+            endTime: eventData.endTime,
+            location: eventData.location,
+            attendeesCount: eventData.attendees.length,
+            reminders: eventData.reminders,
+            duration: Math.round((new Date(eventData.endTime) - new Date(eventData.startTime)) / (1000 * 60)) + ' minutes'
+          });
+
+          const createdEvent = await createEvent(eventData);
+          createdCount++;
+          createdEvents.push(event.title);
+          
+          console.log(`✅ [DASHBOARD] Event ${index + 1} created successfully:`, {
+            requestId,
+            eventIndex: index + 1,
+            title: event.title,
+            createdEventId: createdEvent?.id,
+            createdEventSummary: createdEvent?.summary
+          });
+        } catch (eventError) {
+          console.error(`❌ [DASHBOARD] Failed to create event ${index + 1}:`, {
+            requestId,
+            eventIndex: index + 1,
+            title: event.title,
+            error: eventError.message,
+            errorStack: eventError.stack,
+            errorResponse: eventError.response?.data,
+            errorStatus: eventError.response?.status,
+            errorStatusText: eventError.response?.statusText
+          });
+          failedEvents.push({
+            title: event.title,
+            error: eventError.message,
+            status: eventError.response?.status
+          });
+        }
       }
       
+      console.log('📊 [DASHBOARD] Event creation summary:', {
+        requestId,
+        totalEvents: eventCount,
+        createdCount,
+        failedCount: failedEvents.length,
+        createdEvents,
+        failedEvents
+      });
+      
       let confirmationMessage;
-      if (eventCount === 1) {
-        const event = events[0];
-        const startTime = new Date(event.suggestedTime);
+      if (failedEvents.length === 0) {
+        // All events created successfully
+        if (eventCount === 1) {
+          const event = events[0];
+          const startTime = new Date(event.suggestedTime);
+          confirmationMessage = {
+            id: Date.now(),
+            type: 'ai',
+            content: `🎉 Perfect! "${event.title}" has been successfully added to your calendar for ${format(startTime, 'EEEE, MMMM d, yyyy')} at ${format(startTime, 'h:mm a')}. You're all set! ✨`
+          };
+        } else {
+          confirmationMessage = {
+            id: Date.now(),
+            type: 'ai',
+            content: `🎉 Excellent! I've successfully added ${createdCount} events to your calendar:\n\n${createdEvents.map((title, index) => `✅ ${index + 1}. ${title}`).join('\n')}\n\nYou're all organized and ready to go! ✨`
+          };
+        }
+      } else if (createdCount > 0) {
+        // Some events created, some failed
+        const successList = createdEvents.map((title, index) => `✅ ${index + 1}. ${title}`).join('\n');
+        const failedList = failedEvents.map((item, index) => `❌ ${index + 1}. ${item.title} (${item.error})`).join('\n');
+        
         confirmationMessage = {
           id: Date.now(),
           type: 'ai',
-          content: `🎉 Perfect! "${event.title}" has been successfully added to your calendar for ${format(startTime, 'EEEE, MMMM d, yyyy')} at ${format(startTime, 'h:mm a')}. You're all set! ✨`
+          content: `⚠️ Mixed results: I successfully created ${createdCount} event(s), but ${failedEvents.length} failed:\n\n**Created:**\n${successList}\n\n**Failed:**\n${failedList}\n\nYou can try creating the failed events again or let me know if you'd like to adjust anything! 😊`
         };
       } else {
+        // All events failed
+        const failedList = failedEvents.map((item, index) => `❌ ${index + 1}. ${item.title} (${item.error})`).join('\n');
+        
         confirmationMessage = {
           id: Date.now(),
           type: 'ai',
-          content: `🎉 Excellent! I've successfully added ${createdCount} events to your calendar:\n\n${createdEvents.map((title, index) => `✅ ${index + 1}. ${title}`).join('\n')}\n\nYou're all organized and ready to go! ✨`
+          content: `❌ I couldn't create any of your events. Here's what went wrong:\n\n${failedList}\n\nPlease try again or let me know if you'd like to adjust anything! 😊`
         };
       }
       
       setChatMessages(prev => [...prev, confirmationMessage]);
     } catch (error) {
-      console.error('❌ [DASHBOARD] Error creating events:', {
+      console.error('❌ [DASHBOARD] Unexpected error in event creation:', {
+        requestId,
         error: error.message,
+        errorStack: error.stack,
         status: error.response?.status,
         data: error.response?.data,
-        stack: error.stack
+        errorResponse: error.response?.data,
+        errorStatus: error.response?.status,
+        errorStatusText: error.response?.statusText
       });
       
       const errorMessage = {
@@ -912,6 +1145,33 @@ const Dashboard = () => {
                     }`}
                   >
                     <div className="whitespace-pre-wrap">{message.content}</div>
+                    
+                    {/* Overlap handling buttons */}
+                    {message.hasOverlaps && message.overlapEvents && (
+                      <div className="mt-3 space-y-2">
+                        <div className="text-xs text-gray-500 mb-2">How would you like to handle this conflict?</div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => handleOverlapChoice('reschedule', message.overlapEvents, message.overlaps)}
+                            className="px-3 py-1 bg-blue-100 text-blue-700 rounded text-xs hover:bg-blue-200 transition-colors"
+                          >
+                            🔄 Reschedule
+                          </button>
+                          <button
+                            onClick={() => handleOverlapChoice('cancel_conflicting', message.overlapEvents, message.overlaps)}
+                            className="px-3 py-1 bg-red-100 text-red-700 rounded text-xs hover:bg-red-200 transition-colors"
+                          >
+                            ❌ Cancel Conflicting
+                          </button>
+                          <button
+                            onClick={() => handleOverlapChoice('create_anyway', message.overlapEvents, message.overlaps)}
+                            className="px-3 py-1 bg-green-100 text-green-700 rounded text-xs hover:bg-green-200 transition-colors"
+                          >
+                            ✅ Create Anyway
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))
@@ -961,6 +1221,63 @@ const Dashboard = () => {
       </div>
 
       {/* Pomodoro timer only shows in notification overlay - no main page timer */}
+
+      {/* Pomodoro Focus Overlay - Full Screen */}
+      {pomodoroState !== 'idle' && isRunning && (
+        <div className="fixed top-0 left-0 w-full h-full bg-slate-950 z-50 flex items-center justify-center" style={{ margin: 0, padding: 0 }}>
+          <div className="text-center">
+            {/* Timer Display - The Hero Element */}
+            <div className={`text-8xl font-light tracking-wider mb-8 ${pomodoroState === 'work' ? 'text-slate-100' : 'text-emerald-300'}`}>
+              {formatTime(timeLeft)}
+            </div>
+            
+            {/* Session Type - Subtle but Clear */}
+            <div className="text-lg text-slate-400 mb-12 tracking-wide">
+              {pomodoroState === 'work' ? 'FOCUS SESSION' : 'BREAK TIME'}
+            </div>
+            
+            {/* Minimal Controls - Fade in on hover */}
+            <div className="opacity-30 hover:opacity-100 transition-opacity duration-500">
+              <div className="flex justify-center space-x-6">
+                {!isRunning ? (
+                  <button
+                    onClick={resumePomodoro}
+                    className="px-8 py-3 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 transition-all duration-300 border border-slate-600 hover:border-slate-500"
+                  >
+                    <Play className="h-4 w-4 inline mr-2" />
+                    Resume
+                  </button>
+                ) : (
+                  <button
+                    onClick={pausePomodoro}
+                    className="px-8 py-3 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 transition-all duration-300 border border-slate-600 hover:border-slate-500"
+                  >
+                    <Pause className="h-4 w-4 inline mr-2" />
+                    Pause
+                  </button>
+                )}
+                <button
+                  onClick={resetPomodoro}
+                  className="px-8 py-3 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 transition-all duration-300 border border-slate-600 hover:border-slate-500"
+                >
+                  <RotateCcw className="h-4 w-4 inline mr-2" />
+                  Stop
+                </button>
+              </div>
+            </div>
+            
+            {/* Subtle Progress Indicator */}
+            <div className="mt-16 w-32 h-1 bg-slate-800 mx-auto rounded-full overflow-hidden">
+              <div 
+                className={`h-full transition-all duration-1000 ease-out ${pomodoroState === 'work' ? 'bg-slate-100' : 'bg-emerald-400'}`}
+                style={{ 
+                  width: `${((workDuration * 60 - timeLeft) / (workDuration * 60)) * 100}%` 
+                }}
+              ></div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Pomodoro Notification Overlay */}
       {showPomodoroNotification && pomodoroNotificationData && (() => {

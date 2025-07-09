@@ -31,6 +31,207 @@ const detectLanguage = (text) => {
   return 'English';
 };
 
+// Action handlers registry - easily extensible for future actions
+const actionHandlers = {
+  'create_event': { 
+    description: "Create new events (meetings, appointments, reminders, etc.)",
+    handler: async (parameters, sessionId, oauth2Client) => {
+      const { event } = parameters;
+      if (!event || !event.title || !event.startTime || !event.endTime) {
+        throw new Error('Missing required event fields');
+      }
+      
+      // Get user's timezone from the event or use UTC as fallback
+      const userTimezone = event.timezone || 'UTC';
+      
+      const calendarEvent = {
+        summary: event.title,
+        description: event.description,
+        start: {
+          dateTime: event.startTime,
+          timeZone: userTimezone,
+        },
+        end: {
+          dateTime: event.endTime,
+          timeZone: userTimezone,
+        },
+        location: event.location,
+        attendees: event.attendees ? event.attendees.map(email => ({ email })) : [],
+        reminders: {
+          useDefault: false,
+          overrides: event.reminders ? event.reminders.map(reminder => ({
+            method: 'email',
+            minutes: reminder === '15 minutes before' ? 15 : 60
+          })) : []
+        }
+      };
+      
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      const response = await calendar.events.insert({
+        calendarId: 'primary',
+        resource: calendarEvent,
+        sendUpdates: 'all'
+      });
+      
+      return {
+        success: true,
+        event: response.data,
+        message: `Event "${event.title}" created successfully!`
+      };
+    }, 
+    requiresConfirmation: false 
+  },
+  
+  'query_events': { 
+    description: "Search and display existing events",
+    handler: async (parameters, sessionId, oauth2Client) => {
+      const { criteria = {} } = parameters;
+      const { startDate, endDate, searchTerm } = criteria;
+      
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      
+      const response = await calendar.events.list({
+        calendarId: 'primary',
+        timeMin: startDate || new Date().toISOString(),
+        timeMax: endDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        singleEvents: true,
+        orderBy: 'startTime',
+        q: searchTerm
+      });
+      
+      const events = response.data.items || [];
+      
+      return {
+        success: true,
+        events: events,
+        count: events.length,
+        message: `Found ${events.length} events matching your criteria.`
+      };
+    }, 
+    requiresConfirmation: false 
+  },
+  
+  'update_event': { 
+    description: "Modify existing events (requires user confirmation)",
+    handler: async (parameters, sessionId, oauth2Client) => {
+      const { eventId, event } = parameters;
+      if (!eventId || !event) {
+        throw new Error('Missing event ID or event data');
+      }
+      
+      const userTimezone = event.timezone || 'UTC';
+      
+      const calendarEvent = {
+        summary: event.title,
+        description: event.description,
+        start: {
+          dateTime: event.startTime,
+          timeZone: userTimezone,
+        },
+        end: {
+          dateTime: event.endTime,
+          timeZone: userTimezone,
+        },
+        location: event.location,
+        attendees: event.attendees ? event.attendees.map(email => ({ email })) : [],
+        reminders: {
+          useDefault: false,
+          overrides: event.reminders ? event.reminders.map(reminder => ({
+            method: 'email',
+            minutes: reminder === '15 minutes before' ? 15 : 60
+          })) : []
+        }
+      };
+      
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      const response = await calendar.events.update({
+        calendarId: 'primary',
+        eventId: eventId,
+        resource: calendarEvent,
+        sendUpdates: 'all'
+      });
+      
+      return {
+        success: true,
+        event: response.data,
+        message: `Event "${event.title}" updated successfully!`
+      };
+    }, 
+    requiresConfirmation: true 
+  },
+  
+  'delete_event': { 
+    description: "Remove events (requires user confirmation)",
+    handler: async (parameters, sessionId, oauth2Client) => {
+      const { eventId, eventTitle } = parameters;
+      if (!eventId) {
+        throw new Error('Missing event ID');
+      }
+      
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+      await calendar.events.delete({
+        calendarId: 'primary',
+        eventId: eventId,
+        sendUpdates: 'all'
+      });
+      
+      return {
+        success: true,
+        message: `Event "${eventTitle || 'Unknown'}" deleted successfully!`
+      };
+    }, 
+    requiresConfirmation: true 
+  }
+  
+  // Easy to add new actions here:
+  // 'new_action': {
+  //   description: "Description of what this action does",
+  //   handler: async (parameters, sessionId, oauth2Client) => {
+  //     // Implementation here
+  //   },
+  //   requiresConfirmation: false // or true if destructive
+  // }
+};
+
+// Generate action descriptions for AI prompt
+const generateActionDescriptions = () => {
+  return Object.entries(actionHandlers)
+    .map(([actionName, config]) => `- ${actionName}: ${config.description}`)
+    .join('\n');
+};
+
+
+
+// Generic action processor
+const processAction = async (action, parameters, sessionId, oauth2Client) => {
+  const actionConfig = actionHandlers[action];
+  
+  if (!actionConfig) {
+    // This should not happen since the AI knows what actions are available
+    console.error(`❌ [SERVER] Unknown action requested: ${action}`);
+    return {
+      success: false,
+      message: `Unknown action: ${action}`,
+      requiresConfirmation: false
+    };
+  }
+  
+  try {
+    const result = await actionConfig.handler(parameters, sessionId, oauth2Client);
+    return {
+      ...result,
+      requiresConfirmation: actionConfig.requiresConfirmation
+    };
+  } catch (error) {
+    console.error(`❌ [SERVER] Action ${action} failed:`, error);
+    return {
+      success: false,
+      message: `Failed to ${action}: ${error.message}`,
+      requiresConfirmation: false
+    };
+  }
+};
+
 const app = express();
 const PORT = process.env.PORT || 50001;
 
@@ -55,6 +256,8 @@ if (proxyConfig.http || proxyConfig.https) {
 // Persistent session store
 const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 const sessions = new Map();
+
+
 
 // Load sessions from file on startup
 const loadSessions = async () => {
@@ -196,7 +399,10 @@ const geminiProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const geminiAgent = geminiProxy ? new (HttpsProxyAgent.HttpsProxyAgent || HttpsProxyAgent)(geminiProxy) : undefined;
 
-async function geminiGenerateContent({ model, prompt }) {
+async function geminiGenerateContent({ model, prompt, retryCount = 0 }) {
+  const maxRetries = 3;
+  const baseDelay = 1000; // 1 second
+  
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`;
   const body = {
     contents: [
@@ -216,6 +422,7 @@ async function geminiGenerateContent({ model, prompt }) {
     hasProxy: !!geminiAgent,
     proxyConfig: geminiProxy || 'none',
     timeout: options.timeout,
+    retryCount: retryCount,
     timestamp: new Date().toISOString()
   });
   
@@ -225,6 +432,7 @@ async function geminiGenerateContent({ model, prompt }) {
       status: response.status,
       statusText: response.statusText,
       responseSize: JSON.stringify(response.data).length,
+      retryCount: retryCount,
       timestamp: new Date().toISOString()
     });
     return response.data;
@@ -240,8 +448,19 @@ async function geminiGenerateContent({ model, prompt }) {
         promptLength: prompt.length,
         hasProxy: !!geminiAgent
       },
+      retryCount: retryCount,
       timestamp: new Date().toISOString()
     });
+    
+    // Retry logic for 503 errors (service overload) and 429 errors (rate limit)
+    if ((error.response?.status === 503 || error.response?.status === 429) && retryCount < maxRetries) {
+      const delay = baseDelay * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
+      console.log(`🔄 [SERVER] Retrying Gemini API request in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return geminiGenerateContent({ model, prompt, retryCount: retryCount + 1 });
+    }
+    
     throw error;
   }
 }
@@ -719,8 +938,9 @@ app.get('/api/calendar/events', calendarLimiter, requireAuth, async (req, res) =
 });
 
 // AI-powered event scheduling
-app.post('/api/ai/schedule', aiLimiter, async (req, res) => {
+app.post('/api/ai/schedule', aiLimiter, requireAuth, async (req, res) => {
   const { description, preferences, existingEvents, timezone } = req.body;
+  const sessionId = req.headers['x-session-id'];
   
   console.log('🔄 [SERVER] AI scheduling request:', {
     description: description ? description.substring(0, 50) + '...' : 'none',
@@ -748,6 +968,19 @@ app.post('/api/ai/schedule', aiLimiter, async (req, res) => {
   }
   
   try {
+    // Set up OAuth2 client for this session
+    const session = sessions.get(sessionId);
+    if (!session || !session.tokens) {
+      console.error('❌ [SERVER] No valid session found for AI scheduling:', {
+        sessionId: sessionId.substring(0, 8) + '...',
+        hasSession: !!session,
+        hasTokens: !!session?.tokens
+      });
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+    
+    oauth2Client.setCredentials(session.tokens);
+    
     // Get user's calendar events for context
     let calendarContext = '';
     if (existingEvents && existingEvents.length > 0) {
@@ -770,6 +1003,49 @@ app.post('/api/ai/schedule', aiLimiter, async (req, res) => {
       ).join(', ')}. If the user seems stressed or mentions needing to prepare, you can suggest starting a Pomodoro timer to help them focus before their event.`;
     }
     
+    // Function to check for overlapping events
+    const checkForOverlaps = (suggestedEvents, existingEvents) => {
+      const overlaps = [];
+      const now = new Date();
+      
+      // Filter existing events to only include future events (within next 30 days)
+      const futureEvents = existingEvents.filter(existingEvent => {
+        const existingStart = new Date(existingEvent.start.dateTime || existingEvent.start.date);
+        const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+        return existingStart >= now && existingStart <= thirtyDaysFromNow;
+      });
+      
+      console.log('🔍 [SERVER] Overlap check details:', {
+        totalExistingEvents: existingEvents.length,
+        futureEventsCount: futureEvents.length,
+        suggestedEventsCount: suggestedEvents.length,
+        now: now.toISOString(),
+        thirtyDaysFromNow: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString()
+      });
+      
+      suggestedEvents.forEach(suggestedEvent => {
+        const suggestedStart = new Date(suggestedEvent.startTime);
+        const suggestedEnd = new Date(suggestedEvent.endTime);
+        
+        futureEvents.forEach(existingEvent => {
+          const existingStart = new Date(existingEvent.start.dateTime || existingEvent.start.date);
+          const existingEnd = new Date(existingEvent.end.dateTime || existingEvent.end.date);
+          
+          // Check if events overlap
+          if (suggestedStart < existingEnd && suggestedEnd > existingStart) {
+            overlaps.push({
+              suggestedEvent: suggestedEvent,
+              conflictingEvent: existingEvent,
+              overlapType: suggestedStart < existingStart ? 'starts_before' : 
+                          suggestedEnd > existingEnd ? 'ends_after' : 'completely_overlaps'
+            });
+          }
+        });
+      });
+      
+      return overlaps;
+    };
+    
     // Create AI prompt for scheduling
     const userTimezone = timezone || 'UTC';
     const currentTimeInUserTZ = new Date().toLocaleString('en-US', { timeZone: userTimezone });
@@ -778,78 +1054,34 @@ app.post('/api/ai/schedule', aiLimiter, async (req, res) => {
     const detectedLanguage = detectLanguage(description);
     
     const prompt = `
-You are a friendly, helpful AI assistant helping to schedule events. You should be conversational, warm, and extremely human-friendly in your responses. First, determine if the user actually wants to schedule an event or if they're just asking questions. You can suggest multiple events at once if the user's request involves multiple activities, recurring events, or multi-day events.
+You are Vibe, a friendly personal assistant. Respond in the same language as the user.
 
-Event Description: ${description}
-User Preferences: ${preferences}
-User Timezone: ${userTimezone}
-Current Time in User's Timezone: ${currentTimeInUserTZ}
-Detected Language: ${detectedLanguage}
-${calendarContext}
+CONTEXT:
+User message: ${description}
+User timezone: ${userTimezone}
+Current time: ${currentTimeInUserTZ}
+${calendarContext ? `Calendar context: ${calendarContext}` : ''}
 
-IMPORTANT INSTRUCTIONS:
-1. Analyze the user's intent first. Only suggest scheduling if they explicitly want to add an event to their calendar.
-2. Always provide suggested times in the user's timezone (${userTimezone}).
-3. When suggesting times, consider the user's current local time.
-4. DETECT THE LANGUAGE the user is speaking in and RESPOND IN THE SAME LANGUAGE.
-5. If the user writes in Chinese, respond in Chinese. If they write in English, respond in English. If they write in Spanish, respond in Spanish, etc.
-6. CRITICAL: Use the SAME LANGUAGE as the user's input for ALL event details (title, description, location, reasoning).
-7. DETECTED LANGUAGE: ${detectedLanguage} - Use this language for all responses and event details.
-8. You can suggest multiple events if the user's request involves multiple activities (e.g., "schedule a team meeting and a client call").
-9. For recurring events, create multiple events with the same title but different dates.
-10. For multi-day events, create separate events for each day or use the "multiDay" flag.
-11. For events spanning multiple days, set "multiDay": true and provide start and end dates.
-12. RESPONSE STYLE: Be extremely conversational, friendly, and helpful. Use natural language that feels like talking to a helpful friend.
-13. MESSAGE FORMAT: Write messages that are easy to read, well-formatted, and provide clear, actionable information.
+AVAILABLE ACTIONS:
+${generateActionDescriptions()}
 
-Please provide a JSON response with the following structure:
+RESPONSE FORMAT:
+You must respond with ONLY a JSON object in this exact format:
 {
-  "shouldSchedule": true/false,
-  "message": "Explanation of your response or answer to their question (in the same language as the user's input)",
-  "events": [
-    {
-      "suggestedTime": "YYYY-MM-DDTHH:MM:SS" (in user's timezone),
-      "endTime": "YYYY-MM-DDTHH:MM:SS" (for multi-day events, in user's timezone),
-      "duration": "HH:MM",
-      "title": "Event title" (MUST be in the same language as the user's input),
-      "description": "Detailed description" (MUST be in the same language as the user's input),
-      "location": "Location if applicable" (MUST be in the same language as the user's input),
-      "attendees": ["email1@example.com", "email2@example.com"],
-      "reminders": ["15 minutes before", "1 hour before"] (or equivalent in user's language),
-      "reasoning": "Explanation of why this time was chosen" (MUST be in the same language as the user's input),
-      "multiDay": false (set to true for events spanning multiple days),
-      "recurring": false (set to true for recurring events)
-    }
-  ] (only if shouldSchedule is true, can contain multiple events)
+  "action": "action_name" or "none",
+  "message": "Your response to the user",
+  "parameters": { /* only if action is not "none" */ }
 }
 
-Examples:
-- If user says "What time is it?" → shouldSchedule: false, message: "Hey there! It's currently ${currentTimeInUserTZ} in your timezone (${userTimezone}). Perfect time to plan your day! 😊"
-- If user says "Schedule a meeting tomorrow" → shouldSchedule: true, provide events array with one event
-- If user says "Schedule team meeting and client call tomorrow" → shouldSchedule: true, provide events array with two events
-- If user says "Schedule daily standup meetings this week" → shouldSchedule: true, provide events array with 5 events (Monday-Friday)
-- If user says "Schedule a 3-day conference next week" → shouldSchedule: true, provide events array with 3 events (one for each day) or one multi-day event
-- If user says "Remind me to take fish oil daily" → shouldSchedule: true, create multiple events for the next 30 days
-- If user says "How's the weather?" → shouldSchedule: false, message: "I'd love to help with the weather, but I'm your calendar assistant! I can help you schedule meetings, appointments, or any events you need. What would you like to plan? 🌟"
-- If user says "I'm stressed about my upcoming meeting" and has an event in 5 minutes → shouldSchedule: false, message: "I see you have a meeting coming up soon! Would you like to start a Pomodoro timer to help you focus and prepare? It's a great way to stay productive and calm before important events! 🍅⏰"
-- If user says "I need to prepare for my presentation" and has an event in 5 minutes → shouldSchedule: false, message: "Perfect timing! I notice you have a presentation coming up. How about starting a Pomodoro timer? It'll help you focus and make the most of your preparation time! 🍅✨"
+IMPORTANT: Respond with ONLY the JSON object, no additional text before or after.
 
-CHINESE EXAMPLES:
-- If user says "什么时候开会？" → shouldSchedule: false, message: "你好！我需要一些信息来帮你安排会议。请告诉我会议的主题、参与者和你希望的时间。这样我就能为你找到最合适的时间了！ 😊"
-- If user says "明天下午2点开会" → shouldSchedule: true, provide events array with one event in ${userTimezone} with Chinese titles and descriptions
-- If user says "安排本周的每日站会" → shouldSchedule: true, provide events array with 5 events (周一到周五) with Chinese titles like "每日站会"
-- If user says "下周安排三天会议" → shouldSchedule: true, provide events array with 3 events with Chinese titles like "会议"
-- If user says "我对即将到来的会议感到紧张" and has an event in 5 minutes → shouldSchedule: false, message: "我看到你很快就要开会了！要不要启动一个番茄钟来帮助你集中注意力做准备？这是保持高效和冷静的好方法！🍅⏰"
-- If user says "我需要为演讲做准备" and has an event in 5 minutes → shouldSchedule: false, message: "时机正好！我注意到你很快就要演讲了。要不要启动一个番茄钟？它会帮助你集中注意力，充分利用准备时间！🍅✨"
-
-SPANISH EXAMPLES:
-- If user says "¿Cuándo es la reunión?" → shouldSchedule: false, message: "¡Hola! Necesito un poco más de información para ayudarte a programar la reunión. Por favor dime el tema, participantes y tu tiempo preferido. ¡Así podré encontrar el momento perfecto para ti! 😊"
-- If user says "Programar reunión mañana" → shouldSchedule: true, provide events array with one event with Spanish titles like "Reunión"
-- If user says "Programar reuniones diarias esta semana" → shouldSchedule: true, provide events array with 5 events with Spanish titles like "Reunión Diaria"
-- If user says "Estoy estresado por mi próxima reunión" and has an event in 5 minutes → shouldSchedule: false, message: "¡Veo que tienes una reunión pronto! ¿Te gustaría iniciar un temporizador Pomodoro para ayudarte a concentrarte y prepararte? ¡Es una excelente manera de mantenerte productivo y tranquilo antes de eventos importantes! 🍅⏰"
-- If user says "Necesito prepararme para mi presentación" and has an event in 5 minutes → shouldSchedule: false, message: "¡Momento perfecto! Noto que tienes una presentación pronto. ¿Qué tal si iniciamos un temporizador Pomodoro? ¡Te ayudará a concentrarte y aprovechar al máximo tu tiempo de preparación! 🍅✨"
-
-Remember: CRITICAL - Use the EXACT SAME LANGUAGE as the user's input for ALL event details (title, description, location, reasoning)!
+RULES:
+- Use actions only for event management requests
+- Answer general questions naturally
+- Be conversational and helpful
+- Use the user's timezone for dates
+- Provide startTime and endTime in ISO format for events
+- Maintain conversation context naturally in your responses
 `;
 
     console.log('🤖 [SERVER] Making Google Gemini API call...', {
@@ -866,6 +1098,7 @@ Remember: CRITICAL - Use the EXACT SAME LANGUAGE as the user's input for ALL eve
     console.log('✅ [SERVER] Google Gemini API response received:', {
       responseLength: aiResponse.length,
       responsePreview: aiResponse.substring(0, 100) + '...',
+      fullResponse: aiResponse, // Log the full response for debugging
       hasCandidates: !!data.candidates,
       candidatesCount: data.candidates?.length || 0,
       hasContent: !!data.candidates?.[0]?.content,
@@ -876,42 +1109,74 @@ Remember: CRITICAL - Use the EXACT SAME LANGUAGE as the user's input for ALL eve
     });
     
     // Try to parse the response as JSON, with fallback handling
-    let schedulingSuggestion;
+    let aiResponseData;
     try {
       // Remove Markdown code block fencing if present
       let cleanResponse = aiResponse.trim();
-      if (cleanResponse.startsWith('```json')) {
-        cleanResponse = cleanResponse.replace(/^```json/, '').trim();
-      }
-      if (cleanResponse.startsWith('```')) {
-        cleanResponse = cleanResponse.replace(/^```/, '').trim();
-      }
-      if (cleanResponse.endsWith('```')) {
-        cleanResponse = cleanResponse.replace(/```$/, '').trim();
-      }
-      schedulingSuggestion = JSON.parse(cleanResponse);
       
-      // Check if AI determined we should schedule events
-      if (schedulingSuggestion.shouldSchedule) {
-        console.log('✅ [SERVER] AI determined events should be scheduled:', {
-          eventCount: schedulingSuggestion.events?.length || 0,
-          events: schedulingSuggestion.events?.map(e => ({ title: e.title, time: e.suggestedTime })) || []
+      // Look for JSON at the end of the response (after ```json or ```)
+      const jsonMatch = cleanResponse.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```$/);
+      if (jsonMatch) {
+        cleanResponse = jsonMatch[1];
+      } else {
+        // If no code block, try to find JSON at the end
+        const lastBraceIndex = cleanResponse.lastIndexOf('}');
+        if (lastBraceIndex !== -1) {
+          const firstBraceIndex = cleanResponse.indexOf('{');
+          if (firstBraceIndex !== -1 && firstBraceIndex < lastBraceIndex) {
+            cleanResponse = cleanResponse.substring(firstBraceIndex, lastBraceIndex + 1);
+          }
+        }
+      }
+      
+      aiResponseData = JSON.parse(cleanResponse);
+      
+      console.log('✅ [SERVER] AI response parsed successfully:', {
+        action: aiResponseData.action,
+        hasMessage: !!aiResponseData.message,
+        hasParameters: !!aiResponseData.parameters,
+        parameters: aiResponseData.parameters
+      });
+      
+      // Process the action if one was requested
+      if (aiResponseData.action && aiResponseData.action !== 'none') {
+        console.log('🔄 [SERVER] Processing AI action:', {
+          action: aiResponseData.action,
+          parameters: aiResponseData.parameters
         });
         
-        res.json({
+        const actionResult = await processAction(
+          aiResponseData.action, 
+          aiResponseData.parameters, 
+          sessionId, 
+          oauth2Client
+        );
+        
+        console.log('✅ [SERVER] Action processed:', {
+          action: aiResponseData.action,
+          success: actionResult.success,
+          requiresConfirmation: actionResult.requiresConfirmation,
+          message: actionResult.message
+        });
+        
+        // Return the action result along with AI's message
+        return res.json({
           success: true,
-          shouldSchedule: true,
-          events: schedulingSuggestion.events || []
+          aiMessage: aiResponseData.message,
+          action: aiResponseData.action,
+          actionResult: actionResult,
+          requiresConfirmation: actionResult.requiresConfirmation
         });
       } else {
-        console.log('💬 [SERVER] AI determined no events needed:', {
-          message: schedulingSuggestion.message
-        });
+        // Just chatting - return AI's message
+        console.log('💬 [SERVER] AI is just chatting, no action requested');
         
-        res.json({
+        return res.json({
           success: true,
-          shouldSchedule: false,
-          message: schedulingSuggestion.message
+          aiMessage: aiResponseData.message,
+          action: 'none',
+          actionResult: null,
+          requiresConfirmation: false
         });
       }
     } catch (parseError) {
@@ -921,6 +1186,7 @@ Remember: CRITICAL - Use the EXACT SAME LANGUAGE as the user's input for ALL eve
         responseLength: aiResponse.length,
         responsePreview: aiResponse.substring(0, 500) + '...',
         responseEnd: aiResponse.substring(-200),
+        fullResponse: aiResponse, // Log the full response for debugging
         requestData: {
           description: description ? description.substring(0, 100) + '...' : 'none',
           preferences: preferences ? preferences.substring(0, 100) + '...' : 'none',
@@ -1004,30 +1270,94 @@ Remember: CRITICAL - Use the EXACT SAME LANGUAGE as the user's input for ALL eve
 app.post('/api/calendar/events', requireAuth, async (req, res) => {
   const { title, description, startTime, endTime, location, attendees, reminders } = req.body;
   const sessionId = req.headers['x-session-id'];
+  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
   
   console.log('🔄 [SERVER] Creating calendar event:', {
+    requestId,
     sessionId: sessionId.substring(0, 8) + '...',
     title,
+    description: description?.substring(0, 50) + (description?.length > 50 ? '...' : ''),
     startTime,
     endTime,
     location,
     attendeesCount: attendees?.length || 0,
+    attendees: attendees,
     reminders,
     ip: req.ip,
-    requestBody: req.body
+    timestamp: new Date().toISOString()
   });
   
+  // Validate required fields
+  if (!title || !startTime || !endTime) {
+    console.error('❌ [SERVER] Missing required fields for event creation:', {
+      requestId,
+      sessionId: sessionId.substring(0, 8) + '...',
+      hasTitle: !!title,
+      hasStartTime: !!startTime,
+      hasEndTime: !!endTime,
+      requestBody: req.body
+    });
+    return res.status(400).json({ error: 'Missing required fields: title, startTime, endTime' });
+  }
+  
+  // Validate date formats
   try {
+    const startDate = new Date(startTime);
+    const endDate = new Date(endTime);
+    
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      console.error('❌ [SERVER] Invalid date format for event creation:', {
+        requestId,
+        sessionId: sessionId.substring(0, 8) + '...',
+        startTime,
+        endTime,
+        startDateValid: !isNaN(startDate.getTime()),
+        endDateValid: !isNaN(endDate.getTime())
+      });
+      return res.status(400).json({ error: 'Invalid date format' });
+    }
+    
+    if (endDate <= startDate) {
+      console.error('❌ [SERVER] End time must be after start time:', {
+        requestId,
+        sessionId: sessionId.substring(0, 8) + '...',
+        startTime: startDate.toISOString(),
+        endTime: endDate.toISOString()
+      });
+      return res.status(400).json({ error: 'End time must be after start time' });
+    }
+    
+    console.log('✅ [SERVER] Date validation passed:', {
+      requestId,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      durationMinutes: Math.round((endDate - startDate) / (1000 * 60))
+    });
+  } catch (dateError) {
+    console.error('❌ [SERVER] Date parsing error:', {
+      requestId,
+      sessionId: sessionId.substring(0, 8) + '...',
+      error: dateError.message,
+      startTime,
+      endTime
+    });
+    return res.status(400).json({ error: 'Invalid date format' });
+  }
+  
+  try {
+    // Get user's timezone from the request or use UTC as fallback
+    const userTimezone = req.body.timezone || 'UTC';
+    
     const event = {
       summary: title,
       description: description,
       start: {
         dateTime: startTime,
-        timeZone: 'UTC',
+        timeZone: userTimezone,
       },
       end: {
         dateTime: endTime,
-        timeZone: 'UTC',
+        timeZone: userTimezone,
       },
       location: location,
       attendees: attendees ? attendees.map(email => ({ email })) : [],
@@ -1043,6 +1373,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
     
     console.log('🌐 [SERVER] Making Google Calendar API call to create event...', {
+      requestId,
       sessionId: sessionId.substring(0, 8) + '...',
       calendarId: 'primary',
       eventSummary: event.summary,
@@ -1053,20 +1384,35 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
         location: event.location,
         attendeesCount: event.attendees?.length || 0,
         reminders: event.reminders
-      }
+      },
+      fullEventObject: event
     });
     
+    const apiStartTime = Date.now();
     const response = await calendar.events.insert({
       calendarId: 'primary',
       resource: event,
       sendUpdates: 'all'
     });
+    const apiEndTime = Date.now();
+    const apiResponseTime = apiEndTime - apiStartTime;
     
-    console.log('✅ [SERVER] Google Calendar API event created:', {
+    console.log('✅ [SERVER] Google Calendar API event created successfully:', {
+      requestId,
       sessionId: sessionId.substring(0, 8) + '...',
       eventId: response.data.id,
       eventSummary: response.data.summary,
-      htmlLink: response.data.htmlLink
+      htmlLink: response.data.htmlLink,
+      apiResponseTime: `${apiResponseTime}ms`,
+      responseData: {
+        id: response.data.id,
+        summary: response.data.summary,
+        start: response.data.start,
+        end: response.data.end,
+        location: response.data.location,
+        attendeesCount: response.data.attendees?.length || 0,
+        reminders: response.data.reminders
+      }
     });
     
     res.json({
@@ -1076,24 +1422,53 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     
   } catch (error) {
     console.error('❌ [SERVER] Create event error:', {
+      requestId,
       error: error.message,
-      status: error.code,
-      statusText: error.response?.statusText,
-      responseData: error.response?.data,
+      errorCode: error.code,
+      errorStatus: error.response?.status,
+      errorStatusText: error.response?.statusText,
+      errorResponseData: error.response?.data,
+      errorStack: error.stack,
       requestData: {
         title,
+        description: description?.substring(0, 50) + (description?.length > 50 ? '...' : ''),
         startTime,
         endTime,
         location,
         attendeesCount: attendees?.length || 0,
+        attendees: attendees,
         reminders
       },
       sessionId: sessionId.substring(0, 8) + '...',
-      title,
       ip: req.ip,
-      stack: error.stack
+      timestamp: new Date().toISOString()
     });
-    res.status(500).json({ error: 'Failed to create calendar event' });
+    
+    // Provide more specific error messages based on the error type
+    let errorMessage = 'Failed to create calendar event';
+    let statusCode = 500;
+    
+    if (error.code === 401) {
+      errorMessage = 'Authentication failed - please reconnect your Google Calendar';
+      statusCode = 401;
+    } else if (error.code === 403) {
+      errorMessage = 'Permission denied - check your Google Calendar permissions';
+      statusCode = 403;
+    } else if (error.code === 400) {
+      errorMessage = 'Invalid event data - please check your event details';
+      statusCode = 400;
+    } else if (error.code === 429) {
+      errorMessage = 'Rate limit exceeded - please try again later';
+      statusCode = 429;
+    } else if (error.response?.data?.error?.message) {
+      errorMessage = error.response.data.error.message;
+    }
+    
+    res.status(statusCode).json({ 
+      error: errorMessage,
+      details: error.response?.data?.error?.message || error.message,
+      code: error.code
+    });
   }
 });
 
@@ -1155,10 +1530,10 @@ Select the best time slot and provide reasoning. Respond in JSON format:
       timeSlotsCount: timeSlots.length
     });
 
-    const startTime = Date.now();
+    const aiStartTime = Date.now();
     const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt });
-    const endTime = Date.now();
-    const responseTime = endTime - startTime;
+    const aiEndTime = Date.now();
+    const responseTime = aiEndTime - aiStartTime;
     
     const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     
@@ -1407,10 +1782,10 @@ Suggest optimal Pomodoro strategy:`;
   });
   
   try {
-    const startTime = Date.now();
+    const aiStartTime = Date.now();
     const data = await geminiGenerateContent({ model: 'gemini-2.0-flash', prompt });
-    const endTime = Date.now();
-    const responseTime = endTime - startTime;
+    const aiEndTime = Date.now();
+    const responseTime = aiEndTime - aiStartTime;
     
     const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     

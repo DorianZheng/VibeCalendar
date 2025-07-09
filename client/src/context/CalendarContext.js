@@ -404,6 +404,8 @@ export const CalendarProvider = ({ children }) => {
 
   // Create new event
   const createEvent = async (eventData) => {
+    const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+    
     if (!state.sessionId) {
       console.log('❌ [CLIENT] Cannot create event: No session ID');
       toast.error('Please connect your Google Calendar first');
@@ -412,19 +414,33 @@ export const CalendarProvider = ({ children }) => {
 
     try {
       console.log('🔄 [CLIENT] Creating calendar event...', {
+        requestId,
         title: eventData.title,
+        description: eventData.description?.substring(0, 50) + (eventData.description?.length > 50 ? '...' : ''),
         startTime: eventData.startTime,
-        sessionId: state.sessionId.substring(0, 8) + '...'
+        endTime: eventData.endTime,
+        location: eventData.location,
+        attendeesCount: eventData.attendees?.length || 0,
+        attendees: eventData.attendees,
+        reminders: eventData.reminders,
+        sessionId: state.sessionId.substring(0, 8) + '...',
+        fullEventData: eventData
       });
       
       dispatch({ type: 'SET_LOADING', payload: true });
       
+      const apiStartTime = Date.now();
       const response = await axios.post('/api/calendar/events', eventData);
+      const apiEndTime = Date.now();
+      const responseTime = apiEndTime - apiStartTime;
       
       console.log('✅ [CLIENT] Event created successfully', {
+        requestId,
         eventId: response.data.event?.id,
         title: response.data.event?.summary,
-        sessionId: state.sessionId.substring(0, 8) + '...'
+        sessionId: state.sessionId.substring(0, 8) + '...',
+        responseTime: `${responseTime}ms`,
+        responseData: response.data
       });
       
       dispatch({ type: 'ADD_EVENT', payload: response.data.event });
@@ -433,21 +449,36 @@ export const CalendarProvider = ({ children }) => {
       return response.data.event;
     } catch (error) {
       console.error('❌ [CLIENT] Error creating event:', {
+        requestId,
         status: error.response?.status,
+        statusText: error.response?.statusText,
         message: error.response?.data?.error || error.message,
+        details: error.response?.data?.details,
+        code: error.response?.data?.code,
         title: eventData.title,
         sessionId: state.sessionId.substring(0, 8) + '...',
-        url: error.config?.url
+        url: error.config?.url,
+        requestData: error.config?.data,
+        errorStack: error.stack,
+        timestamp: new Date().toISOString()
       });
       
       if (error.response?.status === 401) {
         dispatch({ type: 'CLEAR_SESSION' });
         clearSessionFromStorage();
         toast.error('Please reconnect your Google Calendar');
+      } else if (error.response?.status === 400) {
+        dispatch({ type: 'SET_ERROR', payload: 'Invalid event data' });
+        toast.error(error.response?.data?.error || 'Invalid event data');
+      } else if (error.response?.status === 403) {
+        dispatch({ type: 'SET_ERROR', payload: 'Permission denied' });
+        toast.error('Permission denied - check your Google Calendar permissions');
+      } else if (error.response?.status === 429) {
+        dispatch({ type: 'SET_ERROR', payload: 'Rate limit exceeded' });
+        toast.error('Too many requests. Please try again later.');
       } else {
         dispatch({ type: 'SET_ERROR', payload: 'Failed to create event' });
-        // Don't show technical errors to user, just log them
-        console.error('Event creation failed:', error.message);
+        toast.error(error.response?.data?.error || 'Failed to create event');
       }
       throw error;
     }
@@ -479,20 +510,61 @@ export const CalendarProvider = ({ children }) => {
         timezone: userTimezone
       });
       
-      console.log('✅ [CLIENT] AI suggestions received', {
-        shouldSchedule: response.data.shouldSchedule,
-        eventCount: response.data.events?.length || 0,
-        message: response.data.message
+      console.log('✅ [CLIENT] AI response received', {
+        action: response.data.action,
+        aiMessage: response.data.aiMessage,
+        requiresConfirmation: response.data.requiresConfirmation,
+        actionResult: response.data.actionResult
       });
       
-      if (response.data.shouldSchedule && response.data.events) {
-        dispatch({ type: 'SET_AI_SUGGESTIONS', payload: response.data.events });
-        return response.data;
-      } else {
-        // Return a special object for non-scheduling responses
+      // Handle different action types
+      if (response.data.action === 'create_event' && response.data.actionResult?.success) {
+        // Event was created successfully
+        const createdEvent = response.data.actionResult.event;
+        dispatch({ type: 'ADD_EVENT', payload: createdEvent });
+        toast.success(response.data.actionResult.message || 'Event created successfully!');
+        
         return {
-          shouldSchedule: false,
-          message: response.data.message
+          success: true,
+          message: response.data.aiMessage,
+          event: createdEvent
+        };
+      } else if (response.data.action === 'query_events' && response.data.actionResult?.success) {
+        // Events were queried successfully
+        const events = response.data.actionResult.events || [];
+        dispatch({ type: 'SET_EVENTS', payload: events });
+        
+        return {
+          success: true,
+          message: response.data.aiMessage,
+          events: events,
+          count: events.length
+        };
+      } else if (response.data.action === 'update_event' || response.data.action === 'delete_event') {
+        // These actions require user confirmation
+        return {
+          success: true,
+          message: response.data.aiMessage,
+          action: response.data.action,
+          actionResult: response.data.actionResult,
+          requiresConfirmation: response.data.requiresConfirmation
+        };
+      } else if (response.data.action === 'none') {
+        // Just chatting - return AI's message
+        return {
+          success: true,
+          message: response.data.aiMessage,
+          action: 'none'
+        };
+      } else {
+        // Action failed or not implemented
+        const errorMessage = response.data.actionResult?.message || 'Action failed';
+        toast.error(errorMessage);
+        
+        return {
+          success: false,
+          message: response.data.aiMessage,
+          error: errorMessage
         };
       }
     } catch (error) {
@@ -689,6 +761,67 @@ export const CalendarProvider = ({ children }) => {
     dispatch({ type: 'CLEAR_AI_SUGGESTIONS' });
   };
 
+  // Confirm AI action (for destructive actions like update/delete)
+  const confirmAIAction = async (action, parameters) => {
+    if (!state.sessionId) {
+      console.log('❌ [CLIENT] Cannot confirm AI action: No session ID');
+      toast.error('Please connect your Google Calendar first');
+      throw new Error('Not authenticated');
+    }
+
+    try {
+      console.log('🔄 [CLIENT] Confirming AI action...', {
+        action,
+        parameters,
+        sessionId: state.sessionId.substring(0, 8) + '...'
+      });
+      
+      dispatch({ type: 'SET_LOADING', payload: true });
+      
+      // Execute the action directly using the existing API endpoints
+      let result;
+      
+      if (action === 'update_event') {
+        const response = await axios.put(`/api/calendar/events/${parameters.eventId}`, parameters.event);
+        result = response.data.event;
+        dispatch({ type: 'UPDATE_EVENT', payload: result });
+        toast.success('Event updated successfully!');
+      } else if (action === 'delete_event') {
+        await axios.delete(`/api/calendar/events/${parameters.eventId}`);
+        dispatch({ type: 'DELETE_EVENT', payload: parameters.eventId });
+        toast.success('Event deleted successfully!');
+        result = { deleted: true };
+      } else {
+        throw new Error(`Unknown action: ${action}`);
+      }
+      
+      console.log('✅ [CLIENT] AI action confirmed and executed:', {
+        action,
+        result
+      });
+      
+      return {
+        success: true,
+        result
+      };
+    } catch (error) {
+      console.error('❌ [CLIENT] Error confirming AI action:', {
+        action,
+        error: error.message,
+        status: error.response?.status
+      });
+      
+      if (error.response?.status === 401) {
+        dispatch({ type: 'CLEAR_SESSION' });
+        clearSessionFromStorage();
+        toast.error('Please reconnect your Google Calendar');
+      } else {
+        toast.error(`Failed to ${action.replace('_', ' ')}: ${error.message}`);
+      }
+      throw error;
+    }
+  };
+
   // Get events for a specific date
   const getEventsForDate = (date) => {
     return state.events.filter(event => {
@@ -751,6 +884,7 @@ export const CalendarProvider = ({ children }) => {
     getAISuggestions,
     smartSchedule,
     clearAISuggestions,
+    confirmAIAction,
     getEventsForDate,
     hasEventsOnDate,
     fetchUserInfo,
