@@ -129,7 +129,7 @@ npm run dev
 
 - **Free Tier**: 15 requests per minute
 - **Paid Tier**: Higher limits available
-- **Model**: Uses `gemini-pro` model
+- **Model**: Uses `gemini-2.5-flash` model by default (globally configured, with automatic fallback to faster models on timeout)
 
 ## 🎯 Usage Examples
 

@@ -11,7 +11,7 @@ async function testGemini() {
     console.log('🤖 Testing Google Gemini API...');
     
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
     
     const prompt = `
 You are an AI assistant helping to schedule events. Given the following information, suggest the best time and details for the event:

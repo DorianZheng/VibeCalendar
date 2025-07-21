@@ -35,7 +35,7 @@ async function testGeminiWithProxy() {
     });
     
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash-exp",
+      model: "gemini-2.5-pro", // Using primary model from global config
       contents: "Hello"
     });
     
@@ -64,7 +64,7 @@ async function testGeminiWithProxy() {
         });
         
         const response = await aiWithProxy.models.generateContent({
-          model: "gemini-2.0-flash-exp",
+          model: "gemini-2.5-pro", // Using primary model from global config
           contents: "Hello"
         });
         

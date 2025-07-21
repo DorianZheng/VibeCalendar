@@ -8,9 +8,103 @@ const axios = require('axios');
 const HttpsProxyAgent = require('https-proxy-agent');
 const fs = require('fs').promises;
 const path = require('path');
+const requestLogger = require('./middleware/requestLogger');
+const { logExternalError, generateExternalRequestId } = require('./utils/externalApiLogger');
 
 // Load environment variables
 dotenv.config();
+
+// Global model configuration - single source of truth for all model selections
+const GLOBAL_MODEL_CONFIG = {
+  // Primary model to use for all AI operations (using faster model for better performance)
+  primaryModel: 'gemini-2.5-flash',
+
+  // Fallback models in order of preference (prioritizing faster models)
+  fallbackModels: [
+    'gemini-2.5-pro', // Keep pro as first fallback for complex tasks
+    'gemini-2.0-flash',
+    'gemini-1.5-flash-8b',
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-flash-001',
+    'gemini-1.5-flash-8b-001',
+    'gemini-2.0-flash-lite-001',
+    'gemini-2.0-flash-lite-preview-02-05',
+    'gemini-2.0-flash-lite-preview',
+    'gemini-2.5-flash-preview-05-20',
+    'gemini-2.5-flash-lite-preview-06-17',
+    'learnlm-2.0-flash-experimental',
+    'gemma-3-4b-it',
+    'gemma-3-12b-it',
+    'gemma-3-27b-it',
+    'gemma-3n-e4b-it',
+    'gemma-3n-e2b-it'
+  ],
+
+  // Get the current model to use (can be overridden by session preferences)
+  getCurrentModel: (sessionModel = null) => {
+    return sessionModel || GLOBAL_MODEL_CONFIG.primaryModel;
+  },
+
+  // Update configuration based on available models from API
+  updateFromAvailableModels: (availableModels) => {
+    if (!availableModels || availableModels.length === 0) {
+      console.log('⚠️ [SERVER] No available models provided, keeping current configuration');
+      return;
+    }
+
+    // Extract model names (remove 'models/' prefix)
+    const modelNames = availableModels.map(m => m.name.replace('models/', ''));
+
+    // Update fallback models to only include available ones
+    const availableFallbacks = GLOBAL_MODEL_CONFIG.fallbackModels.filter(model =>
+      modelNames.includes(model)
+    );
+
+    // If primary model is not available, use first available model
+    let newPrimaryModel = GLOBAL_MODEL_CONFIG.primaryModel;
+    if (!modelNames.includes(GLOBAL_MODEL_CONFIG.primaryModel)) {
+      newPrimaryModel = modelNames[0];
+      console.log(`⚠️ [SERVER] Primary model ${GLOBAL_MODEL_CONFIG.primaryModel} not available, switching to ${newPrimaryModel}`);
+    }
+
+    // Update configuration
+    GLOBAL_MODEL_CONFIG.primaryModel = newPrimaryModel;
+    GLOBAL_MODEL_CONFIG.fallbackModels = availableFallbacks;
+
+    console.log(`✅ [SERVER] Updated global model configuration:`);
+    console.log(`   Primary model: ${GLOBAL_MODEL_CONFIG.primaryModel}`);
+    console.log(`   Available fallbacks: ${GLOBAL_MODEL_CONFIG.fallbackModels.length} models`);
+
+    // Note: Session models will be updated reactively when API calls fail
+  },
+
+  // Session models are now updated reactively in geminiGenerateContent error handler
+
+  // Force update all sessions to use current global model (for admin use)
+  forceUpdateAllSessions: () => {
+    let updatedSessions = 0;
+
+    for (const [sessionId, session] of sessions.entries()) {
+      if (session.preferredModel !== GLOBAL_MODEL_CONFIG.primaryModel) {
+        const oldModel = session.preferredModel;
+        session.preferredModel = GLOBAL_MODEL_CONFIG.primaryModel;
+        updatedSessions++;
+
+        console.log(`🔄 [SERVER] Force updated session ${sessionId.substring(0, 8)}... model: ${oldModel} → ${session.preferredModel}`);
+      }
+    }
+
+    if (updatedSessions > 0) {
+      console.log(`✅ [SERVER] Force updated ${updatedSessions} sessions to use current global model`);
+      // Save sessions to persist the changes
+      saveSessions().catch(err => {
+        console.error('❌ [SERVER] Failed to save updated sessions:', err.message);
+      });
+    }
+
+    return updatedSessions;
+  }
+};
 
 // Language detection helper
 const detectLanguage = (text) => {
@@ -20,50 +114,60 @@ const detectLanguage = (text) => {
   const koreanRegex = /[\uac00-\ud7af]/;
   const arabicRegex = /[\u0600-\u06ff]/;
   const cyrillicRegex = /[\u0400-\u04ff]/;
-  
+
   if (chineseRegex.test(text)) return 'Chinese';
   if (japaneseRegex.test(text)) return 'Japanese';
   if (koreanRegex.test(text)) return 'Korean';
   if (arabicRegex.test(text)) return 'Arabic';
   if (cyrillicRegex.test(text)) return 'Cyrillic';
-  
+
   // Default to English for Latin scripts
   return 'English';
 };
 
-// Action handlers registry - easily extensible for future actions
-const actionHandlers = {
-  'create_event': { 
+// Tool handlers registry - easily extensible for future tools
+const toolHandlers = {
+  'create_event': {
     description: "Create a new event.",
     parameters: {
       event: {
         required: true,
         fields: {
-          title:        { required: true,  desc: "Event title" },
-          startTime:    { required: true,  desc: "Start time (ISO)" },
-          endTime:      { required: true,  desc: "End time (ISO)" },
-          description:  { required: false, desc: "Event details" },
-          location:     { required: false, desc: "Event location" },
-          attendees:    { required: false, desc: "Attendee emails" },
-          reminders:    { required: false, desc: "Reminders" },
-          timezone:     { required: false, desc: "Timezone" }
+          title: { required: true, desc: "Event title" },
+          startTime: { required: true, desc: "Start time (ISO)" },
+          endTime: { required: true, desc: "End time (ISO)" },
+          description: { required: false, desc: "Event details" },
+          location: { required: false, desc: "Event location" },
+          attendees: { required: false, desc: "Attendee emails" },
+          reminders: { required: false, desc: "Reminders" },
+          timezone: { required: false, desc: "Timezone" }
         }
       }
     },
     returns: {
-      success: { desc: "Action success status" },
+      success: { desc: "Tool success status" },
       event: { desc: "Created event data" },
       message: { desc: "User message" }
     },
     handler: async (parameters, sessionId, oauth2Client) => {
-      const { event } = parameters;
+      // Support both nested event format and direct field format
+      let event = parameters.event;
+
+      // If no nested event, check if fields are directly in parameters
+      if (!event) {
+        const { title, startTime, endTime, description, location, attendees, reminders, timezone } = parameters;
+        if (title && startTime && endTime) {
+          event = { title, startTime, endTime, description, location, attendees, reminders, timezone };
+        }
+      }
+
       if (!event || !event.title || !event.startTime || !event.endTime) {
         throw new Error('Missing required event fields');
       }
-      
+
       // Get user's timezone from the event or use UTC as fallback
       const userTimezone = event.timezone || 'UTC';
-      
+
       const calendarEvent = {
         summary: event.title,
         description: event.description,
@@ -85,88 +189,135 @@ const actionHandlers = {
           })) : []
         }
       };
-      
+
       const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
       const response = await calendar.events.insert({
         calendarId: 'primary',
         resource: calendarEvent,
         sendUpdates: 'all'
       });
-      
+
       return {
         success: true,
         event: response.data,
         message: `Event "${event.title}" created successfully!`
       };
-    }, 
-    requiresConfirmation: false 
+    },
+    requiresConfirmation: false
   },
-  
-  'query_events': { 
-    description: "Search and display events.",
+
+  'query_events': {
+    description: "Search and display events with their IDs.",
     parameters: {
       criteria: {
         required: true,
         fields: {
-          startDate:   { required: false, desc: "Start date (ISO)" },
-          endDate:     { required: false, desc: "End date (ISO)" },
-          searchTerm:  { required: false, desc: "Search keyword" }
+          startDate: { required: false, desc: "Start date (ISO)" },
+          endDate: { required: false, desc: "End date (ISO)" },
+          searchTerm: { required: false, desc: "Search keyword" }
         }
       }
     },
     returns: {
-      success: { desc: "Action success status" },
-      events: { desc: "Found events array" },
+      success: { desc: "Tool success status" },
+      events: { desc: "Found events array with IDs" },
       count: { desc: "Event count" },
       message: { desc: "User message" }
     },
     handler: async (parameters, sessionId, oauth2Client) => {
       const { criteria = {} } = parameters;
       const { startDate, endDate, searchTerm } = criteria;
-      
+
+      // Validate and format dates
+      let validStartDate, validEndDate;
+
+      try {
+        if (startDate) {
+          validStartDate = new Date(startDate).toISOString();
+        }
+        if (endDate) {
+          validEndDate = new Date(endDate).toISOString();
+        }
+      } catch (dateError) {
+        console.error('❌ [SERVER] Invalid date format in query_events:', {
+          startDate,
+          endDate,
+          error: dateError.message
+        });
+        return {
+          success: false,
+          message: 'Invalid date format provided. Please use ISO date format (YYYY-MM-DDTHH:mm:ss.sssZ).'
+        };
+      }
+
       const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-      
+
+      // Ensure proper date formatting for Google Calendar API
+      const now = new Date();
+      const defaultStartDate = validStartDate || now.toISOString();
+      const defaultEndDate = validEndDate || new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      console.log('🔍 [SERVER] Query events parameters:', {
+        startDate: defaultStartDate,
+        endDate: defaultEndDate,
+        searchTerm: searchTerm || 'none',
+        originalStartDate: startDate,
+        originalEndDate: endDate
+      });
+
       const response = await calendar.events.list({
         calendarId: 'primary',
-        timeMin: startDate || new Date().toISOString(),
-        timeMax: endDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        timeMin: defaultStartDate,
+        timeMax: defaultEndDate,
         singleEvents: true,
         orderBy: 'startTime',
         q: searchTerm
       });
-      
+
       const events = response.data.items || [];
-      
+
+      // Return events in original Google Calendar format to maintain compatibility
+      const formattedEvents = events.map(event => ({
+        id: event.id,
+        summary: event.summary,
+        start: event.start,
+        end: event.end,
+        description: event.description,
+        location: event.location,
+        attendees: event.attendees,
+        reminders: event.reminders
+      }));
+
       return {
         success: true,
-        events: events,
+        events: formattedEvents,
         count: events.length,
-        message: `Found ${events.length} events matching your criteria.`
+        message: `Found ${events.length} events matching your criteria. Each event has an ID that can be used for deletion.`
       };
-    }, 
-    requiresConfirmation: false 
+    },
+    requiresConfirmation: false
   },
-  
-  'update_event': { 
+
+  'update_event': {
     description: "Update an event (confirmation required).",
     parameters: {
       eventId: { required: true, desc: "ID of event to update" },
       event: {
         required: true,
         fields: {
-          title:        { required: false, desc: "New title" },
-          startTime:    { required: false, desc: "New start time (ISO)" },
-          endTime:      { required: false, desc: "New end time (ISO)" },
-          description:  { required: false, desc: "New details" },
-          location:     { required: false, desc: "New location" },
-          attendees:    { required: false, desc: "New attendee emails" },
-          reminders:    { required: false, desc: "New reminders" },
-          timezone:     { required: false, desc: "New timezone" }
+          title: { required: false, desc: "New title" },
+          startTime: { required: false, desc: "New start time (ISO)" },
+          endTime: { required: false, desc: "New end time (ISO)" },
+          description: { required: false, desc: "New details" },
+          location: { required: false, desc: "New location" },
+          attendees: { required: false, desc: "New attendee emails" },
+          reminders: { required: false, desc: "New reminders" },
+          timezone: { required: false, desc: "New timezone" }
         }
       }
     },
     returns: {
-      success: { desc: "Action success status" },
+      success: { desc: "Tool success status" },
       event: { desc: "Updated event data" },
       message: { desc: "User message" }
     },
@@ -175,56 +326,70 @@ const actionHandlers = {
       if (!eventId || !event) {
         throw new Error('Missing event ID or event data');
       }
-      
-      const userTimezone = event.timezone || 'UTC';
-      
+
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+      // First, get the existing event to preserve required fields
+      const existingEvent = await calendar.events.get({
+        calendarId: 'primary',
+        eventId: eventId
+      });
+
+      // Build update object by merging existing event with new data
       const calendarEvent = {
-        summary: event.title,
-        description: event.description,
-        start: {
-          dateTime: event.startTime,
-          timeZone: userTimezone,
-        },
-        end: {
-          dateTime: event.endTime,
-          timeZone: userTimezone,
-        },
-        location: event.location,
-        attendees: event.attendees ? event.attendees.map(email => ({ email })) : [],
-        reminders: {
+        ...existingEvent.data,
+        summary: event.title || existingEvent.data.summary,
+        description: event.description !== undefined ? event.description : existingEvent.data.description,
+        location: event.location !== undefined ? event.location : existingEvent.data.location,
+        attendees: event.attendees ? event.attendees.map(email => ({ email })) : existingEvent.data.attendees,
+        reminders: event.reminders ? {
           useDefault: false,
-          overrides: event.reminders ? event.reminders.map(reminder => ({
+          overrides: event.reminders.map(reminder => ({
             method: 'email',
             minutes: reminder === '15 minutes before' ? 15 : 60
-          })) : []
-        }
+          }))
+        } : existingEvent.data.reminders
       };
-      
-      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+      // Only update start/end times if both are provided
+      if (event.startTime && event.endTime) {
+        const userTimezone = event.timezone || 'UTC';
+        calendarEvent.start = {
+          dateTime: event.startTime,
+          timeZone: userTimezone,
+        };
+        calendarEvent.end = {
+          dateTime: event.endTime,
+          timeZone: userTimezone,
+        };
+      }
+
       const response = await calendar.events.update({
         calendarId: 'primary',
         eventId: eventId,
         resource: calendarEvent,
         sendUpdates: 'all'
       });
-      
+
       return {
         success: true,
         event: response.data,
-        message: `Event "${event.title}" updated successfully!`
+        message: `Event "${event.title || response.data.summary || 'Unknown'}" updated successfully!`
       };
-    }, 
-    requiresConfirmation: true 
+    },
+    requiresConfirmation: true
   },
-  
-  'delete_event': { 
+
+
+
+  'delete_event': {
     description: "Delete an event (confirmation required).",
     parameters: {
-      eventId:    { required: true, desc: "ID of event to delete" },
+      eventId: { required: true, desc: "ID of event to delete" },
       eventTitle: { required: false, desc: "Title for confirmation" }
     },
     returns: {
-      success: { desc: "Action success status" },
+      success: { desc: "Tool success status" },
       message: { desc: "User message" }
     },
     handler: async (parameters, sessionId, oauth2Client) => {
@@ -232,25 +397,20 @@ const actionHandlers = {
       if (!eventId) {
         throw new Error('Missing event ID');
       }
-      
-      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-      await calendar.events.delete({
-        calendarId: 'primary',
-        eventId: eventId,
-        sendUpdates: 'all'
-      });
-      
+
+      // For delete events that require confirmation, we don't delete immediately
+      // Instead, we return success and let the confirmation process handle the actual deletion
       return {
         success: true,
-        message: `Event "${eventTitle || 'Unknown'}" deleted successfully!`
+        message: `Event "${eventTitle || 'Unknown'}" will be deleted after confirmation.`
       };
-    }, 
-    requiresConfirmation: true 
+    },
+    requiresConfirmation: true
   }
-  
-  // Easy to add new actions here:
-  // 'new_action': {
-  //   description: "Description of what this action does",
+
+  // Easy to add new tools here:
+  // 'new_tool': {
+  //   description: "Description of what this tool does",
   //   handler: async (parameters, sessionId, oauth2Client) => {
   //     // Implementation here
   //   },
@@ -258,11 +418,38 @@ const actionHandlers = {
   // }
 };
 
-// Generate concise action/parameter prompt for the AI
-function generateActionParameterPrompt() {
-  let out = 'ACTIONS:';
-  for (const [action, def] of Object.entries(actionHandlers)) {
-    out += `\n- ${action}: ${def.description}`;
+// Global rate limiting for calendar operations
+const calendarRateLimiter = new Map(); // sessionId -> lastOperationTime
+
+// Helper function to add delays between API calls to prevent rate limiting
+const addApiDelay = async (toolName, index) => {
+  if (index > 0 && (toolName === 'create_event' || toolName === 'update_event' || toolName === 'delete_event' || toolName === 'query_events')) {
+    const delay = 1000; // 1 second delay between calendar API calls
+    console.log(`⏳ [SERVER] Adding ${delay}ms delay between calendar API calls`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+};
+
+// Helper function to enforce rate limiting for calendar operations
+const enforceCalendarRateLimit = async (sessionId, operationType = 'calendar') => {
+  const now = Date.now();
+  const lastOperation = calendarRateLimiter.get(sessionId);
+  const minInterval = 1000; // 1 second minimum between operations
+
+  if (lastOperation && (now - lastOperation) < minInterval) {
+    const waitTime = minInterval - (now - lastOperation);
+    console.log(`⏳ [SERVER] Rate limiting calendar operation for session ${sessionId.substring(0, 8)}..., waiting ${waitTime}ms`);
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+
+  calendarRateLimiter.set(sessionId, Date.now());
+};
+
+// Generate concise tool/parameter prompt for the AI
+function generateToolParameterPrompt() {
+  let out = 'TOOLS:';
+  for (const [tool, def] of Object.entries(toolHandlers)) {
+    out += `\n- ${tool}: ${def.description}`;
     if (def.parameters) {
       out += '\n  Input parameters:';
       for (const [param, meta] of Object.entries(def.parameters)) {
@@ -286,40 +473,42 @@ function generateActionParameterPrompt() {
   return out;
 }
 
-// Generate action descriptions for AI prompt
-const generateActionDescriptions = () => {
-  return Object.entries(actionHandlers)
-    .map(([actionName, config]) => `- ${actionName}: ${config.description}`)
+// Generate tool descriptions for AI prompt
+const generateToolDescriptions = () => {
+  return Object.entries(toolHandlers)
+    .map(([toolName, config]) => `- ${toolName}: ${config.description}`)
     .join('\n');
 };
 
 
 
-// Generic action processor
-const processAction = async (action, parameters, sessionId, oauth2Client) => {
-  const actionConfig = actionHandlers[action];
-  
-  if (!actionConfig) {
-    // This should not happen since the AI knows what actions are available
-    console.error(`❌ [SERVER] Unknown action requested: ${action}`);
+// Generic tool processor
+const processTool = async (tool, parameters, sessionId, oauth2Client) => {
+  const toolConfig = toolHandlers[tool];
+
+  if (!toolConfig) {
+    // This should not happen since the AI knows what tools are available
+    console.error(`❌ [SERVER] Unknown tool requested: ${tool}`);
     return {
       success: false,
-      message: `Unknown action: ${action}`,
+      message: `Unknown tool: ${tool}`,
       requiresConfirmation: false
     };
   }
-  
+
   try {
-    const result = await actionConfig.handler(parameters, sessionId, oauth2Client);
+    const result = await toolConfig.handler(parameters, sessionId, oauth2Client);
+
+    // Ensure requiresConfirmation is set from tool config
     return {
       ...result,
-      requiresConfirmation: actionConfig.requiresConfirmation
+      requiresConfirmation: toolConfig.requiresConfirmation || false
     };
   } catch (error) {
-    console.error(`❌ [SERVER] Action ${action} failed:`, error);
+    console.error(`❌ [SERVER] Tool ${tool} failed:`, error);
     return {
       success: false,
-      message: `Failed to ${action}: ${error.message}`,
+      message: `Failed to ${tool}: ${error.message}`,
       requiresConfirmation: false
     };
   }
@@ -327,6 +516,12 @@ const processAction = async (action, parameters, sessionId, oauth2Client) => {
 
 const app = express();
 const PORT = process.env.PORT || 50001;
+
+// Trust proxy for rate limiting (fixes X-Forwarded-For header error)
+app.set('trust proxy', 1);
+
+// Add request logging middleware
+app.use(requestLogger);
 
 // Configure proxy settings for external API calls
 const proxyConfig = {
@@ -357,7 +552,7 @@ const loadSessions = async () => {
   try {
     const data = await fs.readFile(SESSIONS_FILE, 'utf8');
     const sessionsData = JSON.parse(data);
-    
+
     // Convert back to Map and validate tokens
     for (const [sessionId, sessionData] of Object.entries(sessionsData)) {
       // Check if tokens are still valid (not expired)
@@ -368,7 +563,7 @@ const loadSessions = async () => {
         console.log('⚠️ [SERVER] Skipped expired session:', sessionId.substring(0, 8) + '...');
       }
     }
-    
+
     console.log(`📁 [SERVER] Loaded ${sessions.size} valid sessions from storage`);
   } catch (error) {
     if (error.code === 'ENOENT') {
@@ -386,7 +581,7 @@ const saveSessions = async () => {
     for (const [sessionId, sessionData] of sessions.entries()) {
       sessionsData[sessionId] = sessionData;
     }
-    
+
     await fs.writeFile(SESSIONS_FILE, JSON.stringify(sessionsData, null, 2));
     console.log(`💾 [SERVER] Saved ${sessions.size} sessions to storage`);
   } catch (error) {
@@ -402,14 +597,14 @@ const refreshTokenIfNeeded = async (sessionId, session) => {
   try {
     if (session.tokens.expiry_date && session.tokens.expiry_date <= Date.now() + 5 * 60 * 1000) { // 5 minutes before expiry
       console.log('🔄 [SERVER] Refreshing token for session:', sessionId.substring(0, 8) + '...');
-      
+
       oauth2Client.setCredentials(session.tokens);
       const { credentials } = await oauth2Client.refreshAccessToken();
-      
+
       session.tokens = credentials;
       sessions.set(sessionId, session);
       await saveSessions();
-      
+
       console.log('✅ [SERVER] Token refreshed for session:', sessionId.substring(0, 8) + '...');
     }
   } catch (error) {
@@ -424,14 +619,14 @@ const refreshTokenIfNeeded = async (sessionId, session) => {
 const cleanupExpiredSessions = async () => {
   const now = Date.now();
   let cleanedCount = 0;
-  
+
   for (const [sessionId, session] of sessions.entries()) {
     if (session.tokens.expiry_date && session.tokens.expiry_date < now) {
       sessions.delete(sessionId);
       cleanedCount++;
     }
   }
-  
+
   if (cleanedCount > 0) {
     await saveSessions();
     console.log(`🧹 [SERVER] Cleaned up ${cleanedCount} expired sessions`);
@@ -447,7 +642,7 @@ process.on('SIGINT', async () => {
   await saveSessions();
   server.close(() => {
     console.log('✅ [SERVER] Server closed');
-  process.exit(0);
+    process.exit(0);
   });
 });
 
@@ -456,7 +651,7 @@ process.on('SIGTERM', async () => {
   await saveSessions();
   server.close(() => {
     console.log('✅ [SERVER] Server closed');
-  process.exit(0);
+    process.exit(0);
   });
 });
 
@@ -475,7 +670,12 @@ const generalLimiter = rateLimit({
 
 const calendarLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
-  max: 10 // limit each IP to 10 calendar requests per minute
+  max: 5 // limit each IP to 5 calendar requests per minute
+});
+
+const calendarEventLimiter = rateLimit({
+  windowMs: 10 * 1000, // 10 seconds
+  max: 3 // limit each IP to 3 event operations per 10 seconds
 });
 
 const aiLimiter = rateLimit({
@@ -492,45 +692,94 @@ const geminiProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const geminiAgent = geminiProxy ? new (HttpsProxyAgent.HttpsProxyAgent || HttpsProxyAgent)(geminiProxy) : undefined;
 
-async function geminiGenerateContent({ model, prompt, retryCount = 0 }) {
+async function geminiGenerateContent({ model, conversationHistory = [], currentMessage, systemPrompt = null, retryCount = 0, fallbackAttempt = 0, sessionId = null }) {
   const maxRetries = 3;
   const baseDelay = 1000; // 1 second
-  
+
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`;
-  const body = {
-    contents: [
-      { parts: [{ text: prompt }] }
-    ]
-  };
+
+  // Build conversation contents
+  const contents = [
+    // Add system prompt if provided
+    ...(systemPrompt ? [{
+      role: 'user',
+      parts: [{ text: systemPrompt }]
+    }] : []),
+    // Add conversation history
+    ...(conversationHistory || []).map(msg => ({
+      role: msg.role, // Gemini API supports 'user' and 'model' roles directly
+      parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }]
+    })),
+    // Add current message
+    {
+      role: 'user',
+      parts: [{ text: currentMessage || '' }]
+    }
+  ];
+
+  // Log conversation history details for debugging
+  console.log('📝 [SERVER] Conversation history details:', {
+    conversationHistoryLength: conversationHistory?.length || 0,
+    roles: (conversationHistory || []).map(msg => msg.role),
+    contentPreview: (conversationHistory || []).map(msg => {
+      const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      return contentStr.substring(0, 50) + '...';
+    })
+  });
+
+  const body = { contents };
   const options = {
     headers: { 'Content-Type': 'application/json' },
-    timeout: 20000
+    timeout: fallbackAttempt > 0 ? 15000 : 25000 // Shorter timeout for fallback models
   };
   if (geminiAgent) options.httpsAgent = geminiAgent;
-  
+
+  // Track request for error logging
+  const requestId = generateExternalRequestId();
+  const startTime = Date.now();
+
   console.log('🤖 [SERVER] Making Gemini API request:', {
+    requestId,
     url: url.replace(geminiApiKey, '***API_KEY***'),
     model: model,
-    promptLength: prompt.length,
+    conversationHistoryLength: conversationHistory?.length || 0,
+    currentMessageLength: currentMessage?.length || 0,
+    totalContentLength: JSON.stringify(contents).length,
     hasProxy: !!geminiAgent,
     proxyConfig: geminiProxy || 'none',
     timeout: options.timeout,
     retryCount: retryCount,
+    fallbackAttempt: fallbackAttempt,
     timestamp: new Date().toISOString()
   });
-  
+
   try {
-  const response = await axios.post(url, body, options);
-    console.log('✅ [SERVER] Gemini API request successful:', {
-      status: response.status,
-      statusText: response.statusText,
-      responseSize: JSON.stringify(response.data).length,
-      retryCount: retryCount,
-      timestamp: new Date().toISOString()
-    });
-  return response.data;
+    const response = await axios.post(url, body, options);
+
+    // Log response summary for debugging
+    const responseText = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (responseText) {
+      console.log('📝 [GEMINI] Response summary:', {
+        requestId,
+        model: model,
+        responseLength: responseText.length,
+        preview: responseText.substring(0, 1000) + (responseText.length > 1000 ? '...' : '')
+      });
+    }
+
+    // Mark model as available on success
+    if (modelStatus[model]) {
+      modelStatus[model].available = true;
+      modelStatus[model].lastError = null;
+    }
+
+    return response.data;
   } catch (error) {
+    // Log external API error
+    logExternalError('GEMINI', error, requestId, startTime);
+
     console.error('❌ [SERVER] Gemini API request failed:', {
+      requestId,
       error: error.message,
       status: error.response?.status,
       statusText: error.response?.statusText,
@@ -538,22 +787,198 @@ async function geminiGenerateContent({ model, prompt, retryCount = 0 }) {
       requestUrl: url.replace(geminiApiKey, '***API_KEY***'),
       requestBody: {
         model: model,
-        promptLength: prompt.length,
+        conversationHistoryLength: conversationHistory?.length || 0,
+        currentMessageLength: currentMessage?.length || 0,
         hasProxy: !!geminiAgent
       },
       retryCount: retryCount,
       timestamp: new Date().toISOString()
     });
-    
-    // Retry logic for 503 errors (service overload) and 429 errors (rate limit)
-    if ((error.response?.status === 503 || error.response?.status === 429) && retryCount < maxRetries) {
+
+    // Model fallback configuration - using global config
+    const modelFallbacks = {};
+
+    // Create fallback mappings for all models using the global fallback list
+    const allModels = [GLOBAL_MODEL_CONFIG.primaryModel, ...GLOBAL_MODEL_CONFIG.fallbackModels];
+    allModels.forEach((currentModel, index) => {
+      // Get remaining models as fallbacks
+      const fallbacks = GLOBAL_MODEL_CONFIG.fallbackModels.slice(index);
+      modelFallbacks[currentModel] = fallbacks;
+    });
+
+    console.log(`🔍 [SERVER] Model fallback configuration for ${model}:`, {
+      model: model,
+      fallbacks: modelFallbacks[model] || [],
+      fallbackCount: (modelFallbacks[model] || []).length
+    });
+
+    // Retry logic for 503 errors (service overload) - retry with same model
+    if (error.response?.status === 503 && retryCount < maxRetries) {
       const delay = baseDelay * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
-      console.log(`🔄 [SERVER] Retrying Gemini API request in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
-      
+      console.log(`🔄 [SERVER] Retrying Gemini API request with same model ${model} in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+
       await new Promise(resolve => setTimeout(resolve, delay));
-      return geminiGenerateContent({ model, prompt, retryCount: retryCount + 1 });
+      return geminiGenerateContent({ model, currentMessage, conversationHistory, retryCount: retryCount + 1, sessionId });
     }
-    
+
+    // Handle timeout errors by switching to faster models
+    if (error.code === 'ECONNABORTED' && error.message.includes('timeout')) {
+      const fallbacks = modelFallbacks[model] || [];
+
+      console.log(`⏰ [SERVER] Timeout detected for model ${model}, attempting to switch to faster model`);
+      console.log(`🔍 [SERVER] Timeout fallback configuration:`, {
+        model: model,
+        fallbacksAvailable: fallbacks.length,
+        fallbacks: fallbacks.slice(0, 3) // Show first 3 fallbacks
+      });
+
+      if (fallbackAttempt < fallbacks.length) {
+        const nextModel = fallbacks[fallbackAttempt];
+        console.log(`🔄 [SERVER] Switching from ${model} to faster model: ${nextModel} due to timeout (attempt ${fallbackAttempt + 1}/${fallbacks.length})`);
+        console.log(`📝 [SERVER] Preserving conversation context: ${conversationHistory?.length || 0} messages`);
+
+        // Update session's preferred model if sessionId is provided
+        if (sessionId && sessions.has(sessionId)) {
+          const session = sessions.get(sessionId);
+          if (session.preferredModel === model) {
+            session.preferredModel = nextModel;
+            sessions.set(sessionId, session);
+            await saveSessions();
+            console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${nextModel} due to timeout`);
+          }
+        }
+
+        // Try with the next fallback model, using intelligent conversation history compaction
+        const optimizedHistory = await compactConversationHistory(conversationHistory, {
+          maxMessages: 6,
+          maxTotalLength: 4000, // More aggressive for timeout recovery
+          preserveSystemMessage: true,
+          preserveRecentMessages: 4
+        });
+
+        return geminiGenerateContent({
+          model: nextModel,
+          currentMessage,
+          conversationHistory: optimizedHistory,
+          retryCount: 0,
+          fallbackAttempt: fallbackAttempt + 1,
+          sessionId
+        });
+      } else {
+        console.error(`❌ [SERVER] All fallback models exhausted for timeout recovery. No more models available.`);
+      }
+    }
+
+    // Update model status on error
+    if (modelStatus[model]) {
+      modelStatus[model].lastError = {
+        status: error.response?.status,
+        message: error.message,
+        timestamp: new Date().toISOString()
+      };
+      modelStatus[model].errorCount++;
+
+      // Mark model as temporarily unavailable if it hits rate limits
+      if (error.response?.status === 429) {
+        modelStatus[model].available = false;
+        console.log(`⚠️ [SERVER] Model ${model} marked as temporarily unavailable due to rate limit`);
+      }
+    }
+
+    // Update session's preferred model if the current model is not available (404, 403, etc.)
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId);
+      const isModelAvailabilityError = (
+        error.response?.status === 404 ||
+        error.response?.status === 403 ||
+        (error.response?.data?.error?.message && error.response.data.error.message.includes('not found'))
+      );
+
+      // Don't update on 400 errors unless they're clearly model-related (not format issues)
+      const isModelRelated400 = (
+        error.response?.status === 400 &&
+        error.response?.data?.error?.message &&
+        (error.response.data.error.message.includes('not found') ||
+          error.response.data.error.message.includes('model'))
+      );
+
+      const shouldUpdateModel = (
+        session.preferredModel === model &&
+        (isModelAvailabilityError || isModelRelated400)
+      );
+
+      if (shouldUpdateModel) {
+        console.log(`🔄 [SERVER] Session ${sessionId.substring(0, 8)}... model ${model} failed (${error.response?.status}), updating to ${GLOBAL_MODEL_CONFIG.primaryModel}`);
+        session.preferredModel = GLOBAL_MODEL_CONFIG.primaryModel;
+        sessions.set(sessionId, session);
+        await saveSessions();
+        console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${GLOBAL_MODEL_CONFIG.primaryModel}`);
+      }
+    }
+
+    // Switch models on 429 errors (rate limit) immediately without retrying same model
+    if (error.response?.status === 429) {
+      const fallbacks = modelFallbacks[model] || [];
+
+      console.log(`🔍 [SERVER] Model switching debug:`, {
+        model: model,
+        errorStatus: error.response?.status,
+        retryCount: retryCount,
+        maxRetries: maxRetries,
+        fallbackAttempt: fallbackAttempt,
+        fallbacksAvailable: fallbacks.length,
+        fallbacks: fallbacks
+      });
+
+      if (fallbackAttempt < fallbacks.length) {
+        const nextModel = fallbacks[fallbackAttempt];
+        console.log(`🔄 [SERVER] Model ${model} hit rate limit (429), switching to fallback model: ${nextModel} (attempt ${fallbackAttempt + 1}/${fallbacks.length})`);
+        console.log(`📝 [SERVER] Preserving conversation context: ${conversationHistory?.length || 0} messages`);
+
+        // Validate conversation history before switching models
+        if (conversationHistory && conversationHistory.length > 0) {
+          console.log(`✅ [SERVER] Conversation history validated: ${conversationHistory.length} messages preserved`);
+          console.log(`📋 [SERVER] Conversation history details during model switch:`, {
+            roles: conversationHistory.map(msg => msg.role),
+            hasSystemMessage: conversationHistory.some(msg => msg.role === 'user' && msg.content.includes('AVAILABLE TOOLS')),
+            systemMessagePreview: conversationHistory.find(msg => msg.role === 'user' && msg.content.includes('AVAILABLE TOOLS'))?.content.substring(0, 100) + '...'
+          });
+        } else {
+          console.warn(`⚠️ [SERVER] Empty conversation history during model switch`);
+        }
+
+        // Update session's preferred model if sessionId is provided
+        if (sessionId && sessions.has(sessionId)) {
+          const session = sessions.get(sessionId);
+          session.preferredModel = nextModel;
+          sessions.set(sessionId, session);
+          await saveSessions();
+          console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${nextModel}`);
+        } else {
+          console.warn(`⚠️ [SERVER] No sessionId provided or session not found for model switch`);
+        }
+
+        // Try with the next fallback model, using compaction for rate limit recovery
+        const compactedHistory = await compactConversationHistory(conversationHistory, {
+          maxMessages: 6,
+          maxTotalLength: 4000, // More aggressive for rate limit recovery
+          preserveSystemMessage: true,
+          preserveRecentMessages: 4
+        });
+
+        return geminiGenerateContent({
+          model: nextModel,
+          currentMessage,
+          conversationHistory: compactedHistory,
+          retryCount: 0,
+          fallbackAttempt: fallbackAttempt + 1,
+          sessionId
+        });
+      } else {
+        console.error(`❌ [SERVER] All fallback models exhausted for ${model}. No more models available.`);
+      }
+    }
+
     throw error;
   }
 }
@@ -564,21 +989,67 @@ const testGeminiConnection = async () => {
     console.log('⚠️ [SERVER] Skipping Gemini API test - no API key configured');
     return;
   }
+
   try {
-    console.log('🔄 [SERVER] Testing Google Gemini API connection...');
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt: 'Hello' });
-    if (data && data.candidates) {
-      console.log('✅ [SERVER] Google Gemini API connection successful');
-    } else {
-      console.log('⚠️ [SERVER] Gemini API responded but no candidates in response');
+    console.log('🔄 [SERVER] Fetching available models from Gemini API...');
+
+    // Fetch available models from Gemini API
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models?key=' + geminiApiKey);
+    const data = await response.json();
+
+    if (!data.models) {
+      console.error('❌ [SERVER] Failed to fetch models from Gemini API');
+      return;
     }
+
+    // Filter models that support generateContent
+    const availableModels = data.models.filter(model =>
+      model.supportedGenerationMethods &&
+      model.supportedGenerationMethods.includes('generateContent')
+    );
+
+    console.log(`📋 [SERVER] Found ${availableModels.length} models that support generateContent`);
+
+    // Update global configuration based on available models
+    GLOBAL_MODEL_CONFIG.updateFromAvailableModels(availableModels);
+
+    // Test the primary model first, then a few others
+    const testModels = [
+      GLOBAL_MODEL_CONFIG.primaryModel,
+      ...availableModels.slice(0, 3).map(m => m.name.replace('models/', ''))
+    ].filter((model, index, arr) => arr.indexOf(model) === index); // Remove duplicates
+
+    console.log(`🧪 [SERVER] Testing ${testModels.length} models: ${testModels.join(', ')}`);
+
+    for (const model of testModels) {
+      try {
+        console.log(`🔄 [SERVER] Testing Google Gemini API connection with model: ${model}...`);
+        const modelResult = await callModel({
+          model: model,
+          currentMessage: 'Hello',
+          options: {
+            enableModelSwitching: false, // Disable switching for connection test
+            enableCompaction: false
+          }
+        });
+        const data = modelResult.data;
+        if (data && data.candidates) {
+          console.log(`✅ [SERVER] Google Gemini API connection successful with model: ${model}`);
+          return; // Success, no need to test other models
+        } else {
+          console.log(`⚠️ [SERVER] Gemini API responded but no candidates in response for model: ${model}`);
+        }
+      } catch (error) {
+        console.log(`❌ [SERVER] Model ${model} failed:`, error.response?.status || error.message);
+        // Continue to next model
+      }
+    }
+
+    console.error('❌ [SERVER] All tested Gemini models failed. Please check your GEMINI_API_KEY and internet connection');
+
   } catch (error) {
-    if (error.response) {
-      console.error('❌ [SERVER] Google Gemini API connection failed:', error.response.data);
-    } else {
-      console.error('❌ [SERVER] Google Gemini API connection failed:', error.message);
-    }
-    console.log('💡 [SERVER] Please check your GEMINI_API_KEY and internet connection');
+    console.error('❌ [SERVER] Failed to fetch models from Gemini API:', error.message);
+    console.error('❌ [SERVER] Please check your GEMINI_API_KEY and internet connection');
   }
 };
 
@@ -594,16 +1065,34 @@ const oauth2Client = new google.auth.OAuth2(
 // Store active watch subscriptions
 const watchSubscriptions = new Map();
 
+// Track model availability and performance - using global config
+const modelStatus = {};
+
+// Initialize model status for all models in global config
+const allModels = [GLOBAL_MODEL_CONFIG.primaryModel, ...GLOBAL_MODEL_CONFIG.fallbackModels];
+allModels.forEach(model => {
+  modelStatus[model] = { available: true, lastError: null, errorCount: 0 };
+});
+
 // Google Calendar Watch API setup
 const setupCalendarWatch = async (sessionId, oauth2Client) => {
+  // Skip webhook setup in development mode (localhost)
+  const isDevelopment = process.env.NODE_ENV === 'development' ||
+    (process.env.CLIENT_URL && process.env.CLIENT_URL.includes('localhost'));
+
+  if (isDevelopment) {
+    console.log('⚠️ [SERVER] Skipping Google Calendar watch setup in development mode');
+    return null;
+  }
+
   try {
     console.log('🔄 [SERVER] Setting up Google Calendar watch for session:', sessionId.substring(0, 8) + '...');
-    
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     // Create a unique webhook URL for this session
     const webhookUrl = `${process.env.CLIENT_URL || 'http://localhost:3000'}/api/calendar/webhook/${sessionId}`;
-    
+
     const watchRequest = {
       id: `vibe-calendar-${sessionId}`,
       type: 'web_hook',
@@ -612,12 +1101,12 @@ const setupCalendarWatch = async (sessionId, oauth2Client) => {
         ttl: '604800' // 7 days in seconds
       }
     };
-    
+
     const response = await calendar.events.watch({
       calendarId: 'primary',
       resource: watchRequest
     });
-    
+
     // Store the subscription
     watchSubscriptions.set(sessionId, {
       subscriptionId: response.data.id,
@@ -625,13 +1114,13 @@ const setupCalendarWatch = async (sessionId, oauth2Client) => {
       expiration: response.data.expiration,
       webhookUrl
     });
-    
+
     console.log('✅ [SERVER] Google Calendar watch setup successful:', {
       sessionId: sessionId.substring(0, 8) + '...',
       subscriptionId: response.data.id,
       expiration: response.data.expiration
     });
-    
+
     return response.data;
   } catch (error) {
     console.error('❌ [SERVER] Failed to setup Google Calendar watch:', {
@@ -651,20 +1140,20 @@ const stopCalendarWatch = async (sessionId) => {
       console.log('⚠️ [SERVER] No active watch subscription found for session:', sessionId.substring(0, 8) + '...');
       return;
     }
-    
+
     console.log('🔄 [SERVER] Stopping Google Calendar watch for session:', sessionId.substring(0, 8) + '...');
-    
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     await calendar.channels.stop({
       resource: {
         id: subscription.subscriptionId,
         resourceId: subscription.resourceId
       }
     });
-    
+
     watchSubscriptions.delete(sessionId);
-    
+
     console.log('✅ [SERVER] Google Calendar watch stopped successfully:', {
       sessionId: sessionId.substring(0, 8) + '...'
     });
@@ -679,31 +1168,24 @@ const stopCalendarWatch = async (sessionId) => {
 // Authentication middleware
 const requireAuth = async (req, res, next) => {
   const sessionId = req.headers['x-session-id'];
-  
-  console.log('🔐 [SERVER] Authentication check:', {
-    sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-    path: req.path,
-    method: req.method,
-    ip: req.ip
-  });
-  
+
   if (!sessionId || !sessions.has(sessionId)) {
     console.log('❌ [SERVER] Authentication failed:', {
       sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
       path: req.path,
       method: req.method
     });
-    return res.status(401).json({ 
+    return res.status(401).json({
       error: 'Authentication required',
       message: 'Please connect your Google Calendar first'
     });
   }
-  
+
   const session = sessions.get(sessionId);
-  
+
   // Refresh token if needed
   await refreshTokenIfNeeded(sessionId, session);
-  
+
   // Check if session still exists after potential refresh
   if (!sessions.has(sessionId)) {
     console.log('❌ [SERVER] Session expired during refresh:', {
@@ -711,88 +1193,83 @@ const requireAuth = async (req, res, next) => {
       path: req.path,
       method: req.method
     });
-    return res.status(401).json({ 
+    return res.status(401).json({
       error: 'Session expired',
       message: 'Please reconnect your Google Calendar'
     });
   }
-  
+
   const updatedSession = sessions.get(sessionId);
   oauth2Client.setCredentials(updatedSession.tokens);
   req.session = updatedSession;
-  console.log('✅ [SERVER] Authentication successful:', {
-    sessionId: sessionId.substring(0, 8) + '...',
-    path: req.path,
-    method: req.method
-  });
   next();
 };
 
 // Routes
+app.get('/', (req, res) => {
+  res.json({
+    message: 'VibeCalendar API Server',
+    status: 'running',
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/api/health', (req, res) => {
   console.log('🏥 [SERVER] Health check request:', {
     ip: req.ip,
     userAgent: req.get('User-Agent')
   });
-  res.json({ status: 'OK', message: 'VibeCalendar API is running' });
+  res.json({
+    status: 'OK',
+    message: 'VibeCalendar API is running',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    sessions: sessions.size,
+    modelStatus: modelStatus
+  });
+});
+
+// Force update session models endpoint (for testing)
+app.post('/api/admin/update-session-models', (req, res) => {
+  console.log('🔄 [SERVER] Manual session model update requested');
+  GLOBAL_MODEL_CONFIG.forceUpdateAllSessions();
+  res.json({
+    success: true,
+    message: 'Session models updated to use current global model',
+    primaryModel: GLOBAL_MODEL_CONFIG.primaryModel
+  });
 });
 
 // Session validation endpoint
 app.get('/api/auth/session', async (req, res) => {
   const sessionId = req.headers['x-session-id'];
-  
+
   console.log('🔍 [SERVER] Session validation request:', {
     sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
     ip: req.ip
   });
-  
+
   if (!sessionId || !sessions.has(sessionId)) {
     return res.json({
       valid: false,
       message: 'No valid session found'
     });
   }
-  
+
   const session = sessions.get(sessionId);
-  
-  // Check if token is expired (with 5-minute buffer)
-  if (session.tokens.expiry_date && session.tokens.expiry_date <= Date.now() + 5 * 60 * 1000) {
-    console.log('⚠️ [SERVER] Session expired or expiring soon:', sessionId.substring(0, 8) + '...');
-    
-    // Try to refresh the token first
-    try {
-      await refreshTokenIfNeeded(sessionId, session);
-      
-      // Check if session still exists after refresh attempt
-      if (!sessions.has(sessionId)) {
-        return res.json({
-          valid: false,
-          message: 'Session expired and refresh failed'
-        });
-      }
-    } catch (error) {
-      console.error('❌ [SERVER] Token refresh failed during validation:', error.message);
-    sessions.delete(sessionId);
-    await saveSessions();
-    
-    return res.json({
-      valid: false,
-      message: 'Session expired'
-    });
-    }
-  }
-  
-  // Try to refresh token if needed
+
+  // Try to refresh token if needed (only once)
   try {
     await refreshTokenIfNeeded(sessionId, session);
-    
+
     if (!sessions.has(sessionId)) {
       return res.json({
         valid: false,
-        message: 'Session refresh failed'
+        message: 'Session expired and refresh failed'
       });
     }
-    
+
     console.log('✅ [SERVER] Session validated:', sessionId.substring(0, 8) + '...');
     res.json({
       valid: true,
@@ -814,7 +1291,7 @@ app.get('/api/health/ai', async (req, res) => {
     ip: req.ip,
     timestamp: new Date().toISOString()
   });
-  
+
   if (!geminiApiKey) {
     console.log('❌ [SERVER] AI health check failed: No API key configured');
     return res.json({
@@ -824,17 +1301,25 @@ app.get('/api/health/ai', async (req, res) => {
       timestamp: new Date().toISOString()
     });
   }
-  
+
   try {
     console.log('🔄 [SERVER] Testing Gemini API connection...');
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt: 'Hello, this is a test message.' });
-    
+    const modelResult = await callModel({
+      model: GLOBAL_MODEL_CONFIG.primaryModel,
+      currentMessage: 'Hello, this is a test message.',
+      options: {
+        enableModelSwitching: false, // Disable switching for health check
+        enableCompaction: false
+      }
+    });
+    const data = modelResult.data;
+
     console.log('✅ [SERVER] AI health check successful');
     res.json({
       status: 'OK',
       message: 'AI service is available',
       aiAvailable: true,
-      model: 'gemini-1.5-flash',
+      model: GLOBAL_MODEL_CONFIG.primaryModel,
       responseReceived: !!data.candidates,
       timestamp: new Date().toISOString()
     });
@@ -848,7 +1333,7 @@ app.get('/api/health/ai', async (req, res) => {
       ip: req.ip,
       timestamp: new Date().toISOString()
     });
-    
+
     res.json({
       status: 'ERROR',
       message: 'AI service is not available',
@@ -866,54 +1351,59 @@ app.get('/api/auth/google', (req, res) => {
     ip: req.ip,
     userAgent: req.get('User-Agent')
   });
-  
+
   const scopes = [
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/userinfo.profile',
     'https://www.googleapis.com/auth/userinfo.email'
   ];
-  
+
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: scopes,
     prompt: 'consent'
   });
-  
+
   console.log('✅ [SERVER] OAuth URL generated:', {
     authUrl: authUrl.substring(0, 100) + '...',
     scopes: scopes
   });
-  
+
   res.json({ authUrl });
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
   const { code } = req.query;
-  
+
   console.log('🔄 [SERVER] OAuth callback received:', {
     code: code ? code.substring(0, 10) + '...' : 'none',
     ip: req.ip
   });
-  
+
   try {
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
-    
-    // Create a session
+
+    // Create a session with conversation history and preferred model
     const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
-    sessions.set(sessionId, { tokens, createdAt: new Date() });
-    
+    sessions.set(sessionId, {
+      tokens,
+      createdAt: new Date(),
+      conversationHistory: [],
+      preferredModel: GLOBAL_MODEL_CONFIG.primaryModel // Default preferred model
+    });
+
     // Save sessions to persistent storage
     await saveSessions();
-    
+
     console.log('✅ [SERVER] OAuth tokens received and session created:', {
       sessionId: sessionId.substring(0, 8) + '...',
       accessToken: tokens.access_token ? tokens.access_token.substring(0, 10) + '...' : 'none',
       refreshToken: tokens.refresh_token ? 'present' : 'none',
       expiresIn: tokens.expires_in
     });
-    
+
     // Setup Google Calendar watch for real-time notifications
     try {
       await setupCalendarWatch(sessionId, oauth2Client);
@@ -923,7 +1413,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
         error: watchError.message
       });
     }
-    
+
     // Redirect to frontend with session ID
     const frontendUrl = process.env.CLIENT_URL || 'http://localhost:30001';
     res.redirect(`${frontendUrl}?sessionId=${sessionId}`);
@@ -941,12 +1431,12 @@ app.get('/api/auth/google/callback', async (req, res) => {
 // Logout endpoint
 app.post('/api/auth/logout', async (req, res) => {
   const sessionId = req.headers['x-session-id'];
-  
+
   console.log('🚪 [SERVER] Logout request:', {
     sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
     ip: req.ip
   });
-  
+
   if (sessionId && sessions.has(sessionId)) {
     // Stop Google Calendar watch before removing session
     try {
@@ -957,10 +1447,10 @@ app.post('/api/auth/logout', async (req, res) => {
         error: watchError.message
       });
     }
-    
+
     sessions.delete(sessionId);
     await saveSessions();
-    
+
     console.log('✅ [SERVER] Session removed:', sessionId.substring(0, 8) + '...');
     res.json({
       success: true,
@@ -977,45 +1467,37 @@ app.post('/api/auth/logout', async (req, res) => {
 // Get user information from Google Calendar
 app.get('/api/auth/user', requireAuth, async (req, res) => {
   const sessionId = req.headers['x-session-id'];
-  
-  console.log('🔄 [SERVER] Fetching user information:', {
-    sessionId: sessionId.substring(0, 8) + '...',
-    ip: req.ip
-  });
-  
+
+
+
   try {
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
     const people = google.people({ version: 'v1', auth: oauth2Client });
-    
+
     // Get user's profile information from Google People API
     const profileResponse = await people.people.get({
       resourceName: 'people/me',
       personFields: 'names,emailAddresses'
     });
-    
+
     // Get calendar info for timezone
     const calendarResponse = await calendar.calendarList.list();
     const primaryCalendar = calendarResponse.data.items?.find(cal => cal.primary) || calendarResponse.data.items?.[0];
-    
+
     // Extract user's actual name from People API
     const person = profileResponse.data;
     const name = person.names?.[0]?.displayName || person.names?.[0]?.givenName || 'User';
     const email = person.emailAddresses?.[0]?.value || primaryCalendar?.id || '';
-    
+
     const userInfo = {
       name: name,
       email: email,
       timezone: primaryCalendar?.timeZone || 'UTC',
       calendarId: primaryCalendar?.id || ''
     };
-    
-    console.log('✅ [SERVER] User information retrieved:', {
-      sessionId: sessionId.substring(0, 8) + '...',
-      name: userInfo.name,
-      email: userInfo.email.substring(0, 20) + '...',
-      timezone: userInfo.timezone
-    });
-    
+
+
+
     res.json(userInfo);
   } catch (error) {
     // Log as warning if it's a permission issue (expected when People API scope not available)
@@ -1034,41 +1516,36 @@ app.get('/api/auth/user', requireAuth, async (req, res) => {
         ip: req.ip
       });
     }
-    
+
     // Fallback to calendar info if People API fails
     try {
       const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
       const response = await calendar.calendarList.list();
       const primaryCalendar = response.data.items?.find(cal => cal.primary) || response.data.items?.[0];
-      
+
       if (primaryCalendar) {
         // Try to extract name from calendar summary (remove "Calendar" suffix)
         let name = primaryCalendar.summary || 'User';
         if (name.toLowerCase().includes('calendar')) {
           name = name.replace(/calendar$/i, '').replace(/['s]/g, '').trim();
         }
-        
+
         const userInfo = {
           name: name || 'User',
           email: primaryCalendar.id || '',
           timezone: primaryCalendar.timeZone || 'UTC',
           calendarId: primaryCalendar.id
         };
-        
-        console.log('✅ [SERVER] User information retrieved (fallback):', {
-          sessionId: sessionId.substring(0, 8) + '...',
-          name: userInfo.name,
-          email: userInfo.email.substring(0, 20) + '...',
-          timezone: userInfo.timezone
-        });
-        
+
+
+
         res.json(userInfo);
         return;
       }
     } catch (fallbackError) {
       console.error('❌ [SERVER] Fallback user info also failed:', fallbackError.message);
     }
-    
+
     // If both People API and Calendar fallback fail, return a basic user info
     const basicUserInfo = {
       name: 'User',
@@ -1076,13 +1553,13 @@ app.get('/api/auth/user', requireAuth, async (req, res) => {
       timezone: 'UTC',
       calendarId: ''
     };
-    
+
     console.log('⚠️ [SERVER] Using basic user info (all methods failed):', {
       sessionId: sessionId.substring(0, 8) + '...',
       name: basicUserInfo.name,
       timezone: basicUserInfo.timezone
     });
-    
+
     res.json(basicUserInfo);
   }
 });
@@ -1091,38 +1568,45 @@ app.get('/api/auth/user', requireAuth, async (req, res) => {
 app.get('/api/calendar/events', calendarLimiter, requireAuth, async (req, res) => {
   const { timeMin, timeMax } = req.query;
   const sessionId = req.headers['x-session-id'];
-  
-  console.log('🔄 [SERVER] Fetching calendar events:', {
-    sessionId: sessionId.substring(0, 8) + '...',
-    timeMin,
-    timeMax,
-    ip: req.ip
-  });
-  
+
+
+
   try {
+    // Enforce rate limiting before making API call
+    await enforceCalendarRateLimit(sessionId, 'list');
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
-    console.log('🌐 [SERVER] Making Google Calendar API call...', {
-      sessionId: sessionId.substring(0, 8) + '...',
-      calendarId: 'primary',
-      timeMin,
-      timeMax
-    });
-    
-    const response = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: timeMin || new Date().toISOString(),
-      timeMax: timeMax || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-      singleEvents: true,
-      orderBy: 'startTime'
-    });
-    
-    console.log('✅ [SERVER] Google Calendar API response:', {
-      sessionId: sessionId.substring(0, 8) + '...',
-      eventCount: response.data.items?.length || 0,
-      nextPageToken: response.data.nextPageToken ? 'present' : 'none'
-    });
-    
+
+    // Retry logic for rate limiting
+    let retryCount = 0;
+    const maxRetries = 3;
+    const baseDelay = 1000; // 1 second
+    let response;
+
+    while (retryCount <= maxRetries) {
+      try {
+        response = await calendar.events.list({
+          calendarId: 'primary',
+          timeMin: timeMin || new Date().toISOString(),
+          timeMax: timeMax || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          singleEvents: true,
+          orderBy: 'startTime'
+        });
+        break; // Success, exit retry loop
+      } catch (error) {
+        if (error.code === 429 && retryCount < maxRetries) {
+          const delay = baseDelay * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
+          console.log(`⏳ [SERVER] Rate limited, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          retryCount++;
+        } else {
+          throw error; // Re-throw if not a 429 error or max retries reached
+        }
+      }
+    }
+
+
+
     res.json(response.data);
   } catch (error) {
     console.error('❌ [SERVER] Google Calendar API error:', {
@@ -1135,206 +1619,120 @@ app.get('/api/calendar/events', calendarLimiter, requireAuth, async (req, res) =
   }
 });
 
-// AI-powered event scheduling
-app.post('/api/ai/schedule', aiLimiter, requireAuth, async (req, res) => {
-  const { description, preferences, existingEvents, timezone } = req.body;
-  const sessionId = req.headers['x-session-id'];
-  
-  console.log('🔄 [SERVER] AI scheduling request:', {
+// AI-powered event scheduling with Server-Sent Events
+app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
+  const { description, sessionId, timezone } = req.query;
+
+  // Custom auth check for SSE (since EventSource can't send custom headers)
+  if (!sessionId || !sessions.has(sessionId)) {
+    console.log('❌ [SERVER] SSE Authentication failed:', {
+      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
+      path: req.path,
+      method: req.method
+    });
+
+    res.writeHead(401, {
+      'Content-Type': 'text/event-stream',
+      'Access-Control-Allow-Origin': '*'
+    });
+    res.write(`data: ${JSON.stringify({
+      type: 'error',
+      message: 'Authentication required. Please connect your Google Calendar first.'
+    })}\n\n`);
+    res.end();
+    return;
+  }
+
+  console.log('🔄 [SERVER] AI scheduling request (SSE):', {
     description: description ? description.substring(0, 50) + '...' : 'none',
-    preferences: preferences ? preferences.substring(0, 50) + '...' : 'none',
-    existingEventsCount: existingEvents?.length || 0,
+    sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
     ip: req.ip,
     timestamp: new Date().toISOString()
   });
-  
-  // Check if Gemini API key is configured
-  if (!geminiApiKey) {
-    console.log('⚠️ [SERVER] No Gemini API key configured, using fallback response');
-    return res.json({
-      success: true,
-      suggestion: {
-        suggestedTime: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // Tomorrow
-        duration: "01:00",
-        title: description || "New Event",
-        description: "Event scheduled via fallback",
-        location: "To be determined",
-        attendees: [],
-        reminders: ["15 minutes before"],
-        reasoning: "AI service unavailable - using default scheduling"
-      }
-    });
-  }
-  
+
+  // Set up SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control, x-session-id, Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Credentials': 'true'
+  });
+
+  // Function to send SSE message
+  const sendSSE = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
   try {
-    // Set up OAuth2 client for this session
-    const session = sessions.get(sessionId);
-    if (!session || !session.tokens) {
-      console.error('❌ [SERVER] No valid session found for AI scheduling:', {
-        sessionId: sessionId.substring(0, 8) + '...',
-        hasSession: !!session,
-        hasTokens: !!session?.tokens
-      });
-      return res.status(401).json({ error: 'Invalid session' });
-    }
-    
-    oauth2Client.setCredentials(session.tokens);
-    
-    // Get user's calendar events for context
-    let calendarContext = '';
-    if (existingEvents && existingEvents.length > 0) {
-      console.log('📅 [SERVER] Available events for context:', existingEvents.map(event => ({
-        id: event.id,
-        summary: event.summary,
-        start: event.start.dateTime || event.start.date
-      })));
-      
-      calendarContext = `Existing events: ${existingEvents.map(event => 
-        `ID: ${event.id}, Title: ${event.summary}, Time: ${event.start.dateTime || event.start.date}`
-      ).join(', ')}`;
-    }
-    
-    // Check for upcoming events within 5 minutes for Pomodoro suggestions
-    const now = new Date();
-    const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
-    const upcomingSoon = existingEvents?.filter(event => {
-      const eventTime = new Date(event.start.dateTime || event.start.date);
-      return eventTime >= now && eventTime <= fiveMinutesFromNow;
-    }) || [];
-    
-    if (upcomingSoon.length > 0) {
-      calendarContext += `\n\nPOMODORO SUGGESTION: The user has ${upcomingSoon.length} upcoming event(s) within the next 5 minutes: ${upcomingSoon.map(event => 
-        `${event.summary} at ${new Date(event.start.dateTime || event.start.date).toLocaleTimeString()}`
-      ).join(', ')}. If the user seems stressed or mentions needing to prepare, you can suggest starting a Pomodoro timer to help them focus before their event.`;
-    }
-    
-    // Function to check for overlapping events
-    const checkForOverlaps = (suggestedEvents, existingEvents) => {
-      const overlaps = [];
-      const now = new Date();
-      
-      // Filter existing events to only include future events (within next 30 days)
-      const futureEvents = existingEvents.filter(existingEvent => {
-        const existingStart = new Date(existingEvent.start.dateTime || existingEvent.start.date);
-        const thirtyDaysFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-        return existingStart >= now && existingStart <= thirtyDaysFromNow;
-      });
-      
-      console.log('🔍 [SERVER] Overlap check details:', {
-        totalExistingEvents: existingEvents.length,
-        futureEventsCount: futureEvents.length,
-        suggestedEventsCount: suggestedEvents.length,
-        now: now.toISOString(),
-        thirtyDaysFromNow: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString()
-      });
-      
-      suggestedEvents.forEach(suggestedEvent => {
-        const suggestedStart = new Date(suggestedEvent.startTime);
-        const suggestedEnd = new Date(suggestedEvent.endTime);
-        
-        futureEvents.forEach(existingEvent => {
-          const existingStart = new Date(existingEvent.start.dateTime || existingEvent.start.date);
-          const existingEnd = new Date(existingEvent.end.dateTime || existingEvent.end.date);
-          
-          // Check if events overlap
-          if (suggestedStart < existingEnd && suggestedEnd > existingStart) {
-            overlaps.push({
-              suggestedEvent: suggestedEvent,
-              conflictingEvent: existingEvent,
-              overlapType: suggestedStart < existingStart ? 'starts_before' : 
-                          suggestedEnd > existingEnd ? 'ends_after' : 'completely_overlaps'
-            });
-          }
-        });
-      });
-      
-      return overlaps;
-    };
-    
-    // Create AI prompt for scheduling
+    // Get user session for AI processing
+    const userSession = sessions.get(sessionId);
     const userTimezone = timezone || 'UTC';
     const currentTimeInUserTZ = new Date().toLocaleString('en-US', { timeZone: userTimezone });
-    
-    // Detect user's language
-    const detectedLanguage = detectLanguage(description);
-    
-    const prompt = `
-You are Vibe, a friendly personal assistant. Respond in the same language as the user.
+
+    // Build system message for AI
+    const systemMessage = `You are Vibe, a friendly personal assistant. Respond in the same language as the user. You have access to the following tools:
+
+AVAILABLE TOOLS:
+${generateToolParameterPrompt()}
 
 CONTEXT:
-User message: ${description}
 User timezone: ${userTimezone}
 Current time: ${currentTimeInUserTZ}
-${calendarContext ? `Calendar context: ${calendarContext}` : ''}
 
-AVAILABLE ACTIONS:
-${generateActionParameterPrompt()}
-
-RESPONSE FORMAT:
-You must respond with ONLY a JSON object in this exact format:
+CRITICAL RULES:
+- IF YOU NEED TO CALL TOOLS, MUST RESPOND WITH EXACTLY A JSON OBJECT IN THIS EXACT FORMAT:
 {
-  "actions": [
+  "tools": [
     {
-      "action": "action_name",
-      "parameters": { /* action parameters */ }
+      "tool": "tool_name", /* ONLY USE TOOLS DEFINED IN AVAILABLE TOOLS */
+      "parameters": { /* tool parameters as defined above. Follow the exact parameter structure shown in AVAILABLE TOOLS */ }
     }
   ],
-  "message": "Your response to the user"
-}
-
-OR for no actions:
-{
-  "actions": [],
-  "message": "Your response to the user"
-}
-
-IMPORTANT: Respond with ONLY the JSON object, no additional text before or after.
-
-RULES:
-- Use actions only for event management requests
-- Answer general questions naturally
-- Be conversational and helpful
-- Use the user's timezone for dates
-- Provide startTime and endTime in ISO format for events
-- Maintain conversation context naturally in your responses
+  "message": "Your response to the user while calling tools, in the user's language. Write human-readable messages in this field"
+} 
+- IF YOU CALL TOOLS, ALL NATURAL LANGUAGE RESPONSE MUST BE IN THE "message" FIELD. NO NATURAL LANGUAGE OUTSIDE OF THE "message" FIELD ALLOWED.
 `;
 
-    console.log('🤖 [SERVER] Making Google Gemini API call...', {
-      promptLength: prompt.length,
-      model: "gemini-2.0-flash-exp",
-      detectedLanguage: detectedLanguage,
-      userInput: description.substring(0, 50) + '...'
+    // Get conversation history
+    let fullConversationHistory = userSession.conversationHistory || [];
+
+    // Apply compaction if needed
+    fullConversationHistory = await compactConversationHistory(fullConversationHistory, {
+      maxMessages: 40,
+      maxTotalLength: 25000,
+      preserveRecentMessages: 15,
+      useAI: true,
+      model: userSession.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel,
+      sessionId: sessionId
     });
 
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt });
-    
-    const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
-    console.log('✅ [SERVER] Google Gemini API response received:', {
-      responseLength: aiResponse.length,
-      responsePreview: aiResponse.substring(0, 100) + '...',
-      fullResponse: aiResponse, // Log the full response for debugging
-      hasCandidates: !!data.candidates,
-      candidatesCount: data.candidates?.length || 0,
-      hasContent: !!data.candidates?.[0]?.content,
-      hasParts: !!data.candidates?.[0]?.content?.parts,
-      partsCount: data.candidates?.[0]?.content?.parts?.length || 0,
-      hasText: !!data.candidates?.[0]?.content?.parts?.[0]?.text,
-      timestamp: new Date().toISOString()
+    // Get AI response
+    const modelResult = await callModel({
+      model: userSession.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel,
+      conversationHistory: fullConversationHistory,
+      currentMessage: description,
+      systemPrompt: systemMessage,
+      sessionId: sessionId,
+      options: {
+        enableModelSwitching: true,
+        enableCompaction: true
+      }
     });
-    
-    // Try to parse the response as JSON, with fallback handling
+
+    const data = modelResult.data;
+    const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    // Try to parse the response as JSON
     let aiResponseData;
     try {
-      // Remove Markdown code block fencing if present
       let cleanResponse = aiResponse.trim();
-      
-      // Look for JSON at the end of the response (after ```json or ```)
       const jsonMatch = cleanResponse.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```$/);
       if (jsonMatch) {
         cleanResponse = jsonMatch[1];
       } else {
-        // If no code block, try to find JSON at the end
         const lastBraceIndex = cleanResponse.lastIndexOf('}');
         if (lastBraceIndex !== -1) {
           const firstBraceIndex = cleanResponse.indexOf('{');
@@ -1343,174 +1741,165 @@ RULES:
           }
         }
       }
-      
+
       aiResponseData = JSON.parse(cleanResponse);
-      
-      console.log('✅ [SERVER] AI response parsed successfully:', {
-        actions: aiResponseData.actions?.length || 0,
-        hasMessage: !!aiResponseData.message,
-        actionsList: aiResponseData.actions?.map(a => a.action) || []
-      });
-      
-      // Process multiple actions if requested
-      if (aiResponseData.actions && aiResponseData.actions.length > 0) {
-        console.log('🔄 [SERVER] Processing AI actions:', {
-          actionCount: aiResponseData.actions.length,
-          actions: aiResponseData.actions.map(a => a.action)
+
+      // Send intermittent message immediately if AI wants to use tools
+      if (aiResponseData.tools && aiResponseData.tools.length > 0) {
+        const intermittentMessage = aiResponseData.message;
+        console.log('💬 [SSE] Sending intermittent message:', intermittentMessage);
+        sendSSE({
+          type: 'intermittent',
+          message: intermittentMessage,
+          tools: aiResponseData.tools.map(t => ({
+            name: t.tool,
+            status: 'running'
+          }))
         });
-        
-        const actionResults = [];
-        let requiresConfirmation = false;
-        
-        // Process each action sequentially
-        for (const actionRequest of aiResponseData.actions) {
+
+        // Process tools in background and send final result
+        setTimeout(async () => {
           try {
-            const actionResult = await processAction(
-              actionRequest.action, 
-              actionRequest.parameters, 
-              sessionId, 
-              oauth2Client
-            );
-            
-            actionResults.push({
-              action: actionRequest.action,
-              parameters: actionRequest.parameters,
-              success: actionResult.success,
-              message: actionResult.message,
-              requiresConfirmation: actionResult.requiresConfirmation
-            });
-            
-            // If any action requires confirmation, mark the whole response as requiring confirmation
-            if (actionResult.requiresConfirmation) {
-              requiresConfirmation = true;
+            // Process the tools (simplified version)
+            const toolResults = [];
+            for (const toolRequest of aiResponseData.tools) {
+              try {
+                // Set up authenticated OAuth2 client
+                if (!userSession.tokens) {
+                  console.error('❌ [SSE] No OAuth tokens found for session');
+                  toolResults.push({ success: false, message: 'Please reconnect your Google Calendar' });
+                  continue;
+                }
+
+                const oauth2Client = new google.auth.OAuth2(
+                  process.env.GOOGLE_CLIENT_ID,
+                  process.env.GOOGLE_CLIENT_SECRET,
+                  process.env.GOOGLE_REDIRECT_URI
+                );
+                oauth2Client.setCredentials(userSession.tokens);
+
+                // Refresh token if needed
+                await refreshTokenIfNeeded(sessionId, userSession);
+
+                console.log('✅ [SSE] OAuth2 client authenticated for tool:', toolRequest.tool);
+
+                const toolResult = await processTool(
+                  toolRequest.tool,
+                  toolRequest.parameters,
+                  sessionId,
+                  oauth2Client
+                );
+
+                console.log('🔍 [SSE] Tool result received:', {
+                  tool: toolRequest.tool,
+                  success: toolResult.success,
+                  messageLength: toolResult.message?.length || 0,
+                  hasEvents: toolResult.events?.length || 0,
+                  resultKeys: Object.keys(toolResult || {}),
+                  resultPreview: JSON.stringify(toolResult, null, 2).substring(0, 200) + '...'
+                });
+
+                toolResults.push(toolResult);
+              } catch (toolError) {
+                console.error('❌ [SSE] Tool processing error:', toolError);
+
+                let errorMessage = `Failed to ${toolRequest.tool}`;
+                if (toolError.status === 403 || toolError.code === 403) {
+                  errorMessage = 'Google Calendar access denied. Please reconnect your account.';
+                } else if (toolError.status === 401 || toolError.code === 401) {
+                  errorMessage = 'Google Calendar authentication expired. Please reconnect your account.';
+                } else if (toolError.message && toolError.message.includes('unregistered callers')) {
+                  errorMessage = 'Calendar authentication issue. Please reconnect your Google Calendar.';
+                }
+
+                toolResults.push({ success: false, message: errorMessage });
+              }
             }
-            
-            console.log('✅ [SERVER] Action processed:', {
-              action: actionRequest.action,
-              success: actionResult.success,
-              requiresConfirmation: actionResult.requiresConfirmation,
-              message: actionResult.message
+
+            // Generate final response
+            console.log('🔍 [SSE] All tool results collected:', {
+              toolResultsCount: toolResults.length,
+              toolResults: toolResults.map(r => ({
+                success: r.success,
+                messageLength: r.message?.length || 0,
+                hasEvents: r.events?.length || 0,
+                keys: Object.keys(r || {})
+              })),
+              fullResults: JSON.stringify(toolResults, null, 2).substring(0, 500) + '...'
             });
-          } catch (error) {
-            console.error('❌ [SERVER] Action failed:', {
-              action: actionRequest.action,
-              error: error.message
+
+            const followUpResponse = await callModel({
+              model: userSession.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel,
+              conversationHistory: userSession.conversationHistory,
+              currentMessage: `${JSON.stringify(toolResults, null, 2)}`,
+              systemPrompt: systemMessage,
+              sessionId: sessionId,
+              options: {
+                enableModelSwitching: true,
+                enableCompaction: false
+              }
             });
-            
-            actionResults.push({
-              action: actionRequest.action,
-              parameters: actionRequest.parameters,
-              success: false,
-              message: `Failed to ${actionRequest.action}: ${error.message}`,
-              requiresConfirmation: false
-            });
+
+            const followUpText = followUpResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+            // Update conversation history
+            userSession.conversationHistory = [
+              ...userSession.conversationHistory,
+              { role: 'user', content: description, timestamp: new Date() },
+              { role: 'model', content: followUpText, timestamp: new Date() }
+            ];
+            sessions.set(sessionId, userSession);
+            await saveSessions();
+
+            console.log('✅ [SSE] Sending final message:', followUpText.substring(0, 100) + '...');
+            sendSSE({ type: 'final', message: followUpText });
+            res.end();
+
+          } catch (processingError) {
+            console.error('❌ [SSE] Processing error:', processingError);
+            sendSSE({ type: 'final', message: intermittentMessage + '\n\n抱歉，处理过程中遇到了问题，请稍后再试。' });
+            res.end();
           }
-        }
-        
-        // Return all action results along with AI's message
-        return res.json({
-          success: true,
-          aiMessage: aiResponseData.message,
-          actions: aiResponseData.actions.map(a => a.action),
-          actionResults: actionResults,
-          requiresConfirmation: requiresConfirmation
-        });
+        }, 100);
+
       } else {
-        // Just chatting - return AI's message
-        console.log('💬 [SERVER] AI is just chatting, no actions requested');
-        
-        return res.json({
-          success: true,
-          aiMessage: aiResponseData.message,
-          actions: [],
-          actionResults: [],
-          requiresConfirmation: false
-        });
+        // No tools needed, just chat response
+        console.log('💬 [SSE] Direct chat response');
+        sendSSE({ type: 'final', message: aiResponseData.message || aiResponse });
+
+        // Update conversation history
+        userSession.conversationHistory = [
+          ...userSession.conversationHistory,
+          { role: 'user', content: description, timestamp: new Date() },
+          { role: 'model', content: aiResponseData.message || aiResponse, timestamp: new Date() }
+        ];
+        sessions.set(sessionId, userSession);
+        await saveSessions();
+
+        res.end();
       }
+
     } catch (parseError) {
-      console.error('❌ [SERVER] Failed to parse Gemini response as JSON:', {
-        error: parseError.message,
-        parseErrorStack: parseError.stack,
-        responseLength: aiResponse.length,
-        responsePreview: aiResponse.substring(0, 500) + '...',
-        responseEnd: aiResponse.substring(-200),
-        fullResponse: aiResponse, // Log the full response for debugging
-        requestData: {
-          description: description ? description.substring(0, 100) + '...' : 'none',
-          preferences: preferences ? preferences.substring(0, 100) + '...' : 'none',
-          timezone: timezone || 'not provided',
-          detectedLanguage: detectLanguage(description)
-        },
-        timestamp: new Date().toISOString()
-      });
-      // Return a structured error response
-      return res.status(500).json({ 
-        error: 'AI response format error',
-        details: 'The AI response could not be parsed as valid JSON. This might be due to an unexpected response format from the AI service.',
-        timestamp: new Date().toISOString()
-      });
+      // Not JSON - natural language response
+      console.log('💬 [SSE] Natural language response');
+      sendSSE({ type: 'final', message: aiResponse });
+
+      // Update conversation history
+      userSession.conversationHistory = [
+        ...userSession.conversationHistory,
+        { role: 'user', content: description, timestamp: new Date() },
+        { role: 'model', content: aiResponse, timestamp: new Date() }
+      ];
+      sessions.set(sessionId, userSession);
+      await saveSessions();
+
+      res.end();
     }
-    
+
   } catch (error) {
-    console.error('❌ [SERVER] AI scheduling error:', {
-      error: error.message,
-      code: error.code,
-      status: error.status,
-      statusCode: error.response?.status,
-      statusText: error.response?.statusText,
-      responseData: error.response?.data,
-      requestData: {
-        description: description ? description.substring(0, 100) + '...' : 'none',
-        preferences: preferences ? preferences.substring(0, 100) + '...' : 'none',
-        timezone: timezone || 'not provided',
-        detectedLanguage: detectLanguage(description)
-      },
-      stack: error.stack,
-      ip: req.ip,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Provide more specific error messages based on the error type
-    let errorMessage = 'Failed to generate scheduling suggestion';
-    let errorDetails = '';
-    let statusCode = 500;
-    
-    if (error.message.includes('fetch failed') || error.message.includes('network')) {
-      errorMessage = 'AI service temporarily unavailable';
-      errorDetails = 'Network connectivity issue with AI service. Please try again later.';
-      statusCode = 503;
-    } else if (error.message.includes('API key') || error.message.includes('authentication')) {
-      errorMessage = 'AI service configuration error';
-      errorDetails = 'Please check the AI service configuration.';
-      statusCode = 500;
-    } else if (error.message.includes('quota') || error.message.includes('rate limit')) {
-      errorMessage = 'AI service rate limit exceeded';
-      errorDetails = 'Too many requests to AI service. Please wait a moment and try again.';
-      statusCode = 429;
-    } else if (error.response?.status === 400) {
-      errorMessage = 'Invalid request to AI service';
-      errorDetails = 'The request format was incorrect.';
-      statusCode = 400;
-    } else if (error.response?.status === 401) {
-      errorMessage = 'AI service authentication failed';
-      errorDetails = 'Please check the AI service credentials.';
-      statusCode = 401;
-    } else if (error.response?.status === 403) {
-      errorMessage = 'AI service access denied';
-      errorDetails = 'Insufficient permissions for AI service.';
-      statusCode = 403;
-    } else if (error.response?.status >= 500) {
-      errorMessage = 'AI service internal error';
-      errorDetails = 'The AI service is experiencing issues. Please try again later.';
-      statusCode = 502;
-    }
-    
-    res.status(statusCode).json({ 
-      error: errorMessage,
-      details: errorDetails,
-      retryAfter: statusCode === 429 ? 60 : 30,
-      timestamp: new Date().toISOString()
-    });
+    console.error('❌ [SERVER] SSE error:', error);
+    sendSSE({ type: 'error', message: '处理过程中出错，请稍后再试。' });
+    res.end();
   }
 });
 
@@ -1519,7 +1908,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
   const { title, description, startTime, endTime, location, attendees, reminders } = req.body;
   const sessionId = req.headers['x-session-id'];
   const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  
+
   console.log('🔄 [SERVER] Creating calendar event:', {
     requestId,
     sessionId: sessionId.substring(0, 8) + '...',
@@ -1534,7 +1923,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     ip: req.ip,
     timestamp: new Date().toISOString()
   });
-  
+
   // Validate required fields
   if (!title || !startTime || !endTime) {
     console.error('❌ [SERVER] Missing required fields for event creation:', {
@@ -1547,12 +1936,12 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     });
     return res.status(400).json({ error: 'Missing required fields: title, startTime, endTime' });
   }
-  
+
   // Validate date formats
   try {
     const startDate = new Date(startTime);
     const endDate = new Date(endTime);
-    
+
     if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
       console.error('❌ [SERVER] Invalid date format for event creation:', {
         requestId,
@@ -1564,7 +1953,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
       });
       return res.status(400).json({ error: 'Invalid date format' });
     }
-    
+
     if (endDate <= startDate) {
       console.error('❌ [SERVER] End time must be after start time:', {
         requestId,
@@ -1574,7 +1963,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
       });
       return res.status(400).json({ error: 'End time must be after start time' });
     }
-    
+
     console.log('✅ [SERVER] Date validation passed:', {
       requestId,
       startDate: startDate.toISOString(),
@@ -1591,11 +1980,11 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     });
     return res.status(400).json({ error: 'Invalid date format' });
   }
-  
+
   try {
     // Get user's timezone from the request or use UTC as fallback
     const userTimezone = req.body.timezone || 'UTC';
-    
+
     const event = {
       summary: title,
       description: description,
@@ -1617,9 +2006,9 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
         })) : []
       }
     };
-    
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     console.log('🌐 [SERVER] Making Google Calendar API call to create event...', {
       requestId,
       sessionId: sessionId.substring(0, 8) + '...',
@@ -1635,7 +2024,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
       },
       fullEventObject: event
     });
-    
+
     const apiStartTime = Date.now();
     const response = await calendar.events.insert({
       calendarId: 'primary',
@@ -1644,7 +2033,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     });
     const apiEndTime = Date.now();
     const apiResponseTime = apiEndTime - apiStartTime;
-    
+
     console.log('✅ [SERVER] Google Calendar API event created successfully:', {
       requestId,
       sessionId: sessionId.substring(0, 8) + '...',
@@ -1662,12 +2051,12 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
         reminders: response.data.reminders
       }
     });
-    
+
     res.json({
       success: true,
       event: response.data
     });
-    
+
   } catch (error) {
     console.error('❌ [SERVER] Create event error:', {
       requestId,
@@ -1678,7 +2067,7 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
       errorResponseData: error.response?.data,
       errorStack: error.stack,
       requestData: {
-      title,
+        title,
         description: description?.substring(0, 50) + (description?.length > 50 ? '...' : ''),
         startTime,
         endTime,
@@ -1691,11 +2080,11 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
       ip: req.ip,
       timestamp: new Date().toISOString()
     });
-    
+
     // Provide more specific error messages based on the error type
     let errorMessage = 'Failed to create calendar event';
     let statusCode = 500;
-    
+
     if (error.code === 401) {
       errorMessage = 'Authentication failed - please reconnect your Google Calendar';
       statusCode = 401;
@@ -1711,8 +2100,8 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     } else if (error.response?.data?.error?.message) {
       errorMessage = error.response.data.error.message;
     }
-    
-    res.status(statusCode).json({ 
+
+    res.status(statusCode).json({
       error: errorMessage,
       details: error.response?.data?.error?.message || error.message,
       code: error.code
@@ -1720,197 +2109,105 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
   }
 });
 
-// Smart scheduling with AI
-app.post('/api/ai/smart-schedule', aiLimiter, requireAuth, async (req, res) => {
-  const { description, preferences, constraints } = req.body;
-  const sessionId = req.headers['x-session-id'];
-  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  
-  console.log('🔄 [SERVER] Smart scheduling request:', {
-    requestId,
-    sessionId: sessionId.substring(0, 8) + '...',
-    description: description ? description.substring(0, 50) + '...' : 'none',
-    preferences: preferences ? preferences.substring(0, 50) + '...' : 'none',
-    constraints: constraints ? Object.keys(constraints) : 'none',
-    ip: req.ip,
-    timestamp: new Date().toISOString()
-  });
-  
-  // Log full request details
-  console.log('📋 [SERVER] Full smart scheduling request details:', {
-    requestId,
-    description: description,
-    preferences: preferences,
-    constraints: constraints,
-    requestBody: req.body
-  });
-  
-  try {
-    // Get available time slots
-    const timeSlots = await findAvailableTimeSlots(constraints, oauth2Client);
-    
-    console.log('✅ [SERVER] Available time slots found:', {
-      sessionId: sessionId.substring(0, 8) + '...',
-      timeSlotsCount: timeSlots.length
-    });
-    
-    // Use AI to select the best time slot
-    const prompt = `
-Given these available time slots and the event description, select the best time:
 
-Event: ${description}
-Preferences: ${preferences}
-Available Slots: ${JSON.stringify(timeSlots)}
 
-Select the best time slot and provide reasoning. Respond in JSON format:
-{
-  "selectedSlot": "YYYY-MM-DDTHH:MM:SS",
-  "reasoning": "Why this slot was chosen"
-}
-`;
-
-    console.log('🤖 [SERVER] AI Prompt for smart scheduling:', {
-      requestId,
-      promptLength: prompt.length,
-      promptPreview: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : ''),
-      fullPrompt: prompt,
-      model: 'gemini-2.0-flash-exp',
-      timeSlotsCount: timeSlots.length
-    });
-
-    const aiStartTime = Date.now();
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt });
-    const aiEndTime = Date.now();
-    const responseTime = aiEndTime - aiStartTime;
-    
-    const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
-    console.log('✅ [SERVER] Google Gemini API smart scheduling response received:', {
-      requestId,
-      sessionId: sessionId.substring(0, 8) + '...',
-      responseLength: aiResponse.length,
-      responseTime: `${responseTime}ms`,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Log the full AI response
-    console.log('🤖 [SERVER] AI Response for smart scheduling:', {
-      requestId,
-      responseLength: aiResponse.length,
-      responsePreview: aiResponse.substring(0, 500) + (aiResponse.length > 500 ? '...' : ''),
-      fullResponse: aiResponse
-    });
-    
-    // Try to parse the response as JSON, with fallback handling
-    let selection;
-    try {
-      // Remove Markdown code block fencing if present
-      let cleanResponse = aiResponse.trim();
-      if (cleanResponse.startsWith('```json')) {
-        cleanResponse = cleanResponse.replace(/^```json/, '').trim();
-      }
-      if (cleanResponse.startsWith('```')) {
-        cleanResponse = cleanResponse.replace(/^```/, '').trim();
-      }
-      if (cleanResponse.endsWith('```')) {
-        cleanResponse = cleanResponse.replace(/```$/, '').trim();
-      }
-      
-      console.log('🔧 [SERVER] Attempting to parse smart scheduling response:', {
-        requestId,
-        originalResponseLength: aiResponse.length,
-        cleanedResponseLength: cleanResponse.length,
-        cleanedResponsePreview: cleanResponse.substring(0, 300) + (cleanResponse.length > 300 ? '...' : '')
-      });
-      
-      selection = JSON.parse(cleanResponse);
-      console.log('✅ [SERVER] Smart scheduling response parsed successfully:', {
-        requestId,
-        sessionId: sessionId.substring(0, 8) + '...',
-        selectedSlot: selection.selectedSlot,
-        reasoning: selection.reasoning,
-        parsedSelection: selection
-      });
-    } catch (parseError) {
-      console.error('❌ [SERVER] Failed to parse smart scheduling response as JSON:', {
-        requestId,
-        sessionId: sessionId.substring(0, 8) + '...',
-        error: parseError.message,
-        errorStack: parseError.stack,
-        originalResponse: aiResponse,
-        cleanedResponse: cleanResponse,
-        timestamp: new Date().toISOString()
-      });
-      // Return a structured error response
-      return res.status(500).json({ 
-        error: 'AI response format error',
-        details: 'The AI response could not be parsed as valid JSON',
-        requestId: requestId
-      });
-    }
-    
-    const response = {
-      success: true,
-      selectedTime: selection.selectedSlot,
-      reasoning: selection.reasoning
-    };
-    
-    console.log('✅ [SERVER] Smart scheduling response sent:', {
-      requestId,
-      response: response
-    });
-    
-    res.json(response);
-    
-      } catch (error) {
-      console.error('❌ [SERVER] Smart scheduling error:', {
-      requestId,
-        error: error.message,
-      errorStack: error.stack,
-      errorCode: error.code,
-      errorStatus: error.status,
-        sessionId: sessionId.substring(0, 8) + '...',
-      ip: req.ip,
-      timestamp: new Date().toISOString()
-      });
-      
-      // Provide more specific error messages based on the error type
-      let errorMessage = 'Failed to perform smart scheduling';
-      let errorDetails = '';
-      
-      if (error.message.includes('fetch failed')) {
-        errorMessage = 'AI service temporarily unavailable';
-        errorDetails = 'Network connectivity issue with AI service. Please try again later.';
-      } else if (error.message.includes('API key')) {
-        errorMessage = 'AI service configuration error';
-        errorDetails = 'Please check the AI service configuration.';
-      } else if (error.message.includes('quota') || error.message.includes('rate limit')) {
-        errorMessage = 'AI service rate limit exceeded';
-        errorDetails = 'Too many requests to AI service. Please wait a moment and try again.';
-      }
-      
-      const errorResponse = {
-        error: errorMessage,
-        details: errorDetails,
-        retryAfter: 30, // Suggest retry after 30 seconds
-        requestId: requestId
-      };
-      
-      console.log('❌ [SERVER] Smart scheduling error response sent:', {
-        requestId,
-        errorResponse: errorResponse
-      });
-      
-      res.status(500).json(errorResponse);
-    }
-});
+// Track Pomodoro suggestion cooldowns to prevent spam
+const pomodoroCooldowns = new Map();
+const sessionCooldowns = new Map(); // Track overall session cooldowns
 
 // AI Pomodoro suggestion endpoint
 app.post('/api/ai/pomodoro-suggestion', aiLimiter, requireAuth, async (req, res) => {
   const { upcomingEvents, userLanguage, initializeSession } = req.body;
   const sessionId = req.headers['x-session-id'];
   const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  
+
+  // Check session-level cooldown first (prevents overall spam)
+  const now = Date.now();
+  const sessionCooldownTime = 30 * 1000; // 30 seconds between any Pomodoro requests
+
+  if (sessionCooldowns.has(sessionId)) {
+    const lastSessionRequest = sessionCooldowns.get(sessionId);
+    const timeSinceLastSessionRequest = now - lastSessionRequest;
+
+    if (timeSinceLastSessionRequest < sessionCooldownTime) {
+      const remainingSessionCooldown = Math.ceil((sessionCooldownTime - timeSinceLastSessionRequest) / 1000);
+      console.log('⏰ [SERVER] Session-level Pomodoro cooldown active:', {
+        requestId,
+        sessionId: sessionId.substring(0, 8) + '...',
+        remainingCooldown: `${remainingSessionCooldown}s`
+      });
+
+      return res.status(429).json({
+        error: 'Session cooldown active',
+        message: `Please wait ${remainingSessionCooldown} seconds before requesting another Pomodoro suggestion`,
+        remainingCooldown: remainingSessionCooldown
+      });
+    }
+  }
+
+  // Check event-specific cooldown
+  if (upcomingEvents && upcomingEvents.length > 0) {
+    const primaryEvent = upcomingEvents[0];
+    // Use event title and a time bucket (5-minute intervals) to prevent spam
+    const timeBucket = Math.floor(primaryEvent.timeUntilEvent / 5) * 5;
+    const cooldownKey = `${sessionId}-${primaryEvent.title}-${timeBucket}`;
+
+    // Adjust cooldown based on event urgency
+    let cooldownTime;
+    if (primaryEvent.timeUntilEvent <= 2) {
+      cooldownTime = 2 * 60 * 1000; // 2 minutes for very urgent events
+    } else if (primaryEvent.timeUntilEvent <= 5) {
+      cooldownTime = 3 * 60 * 1000; // 3 minutes for urgent events
+    } else {
+      cooldownTime = 5 * 60 * 1000; // 5 minutes for normal events
+    }
+
+    if (pomodoroCooldowns.has(cooldownKey)) {
+      const lastRequest = pomodoroCooldowns.get(cooldownKey);
+      const timeSinceLastRequest = now - lastRequest;
+
+      if (timeSinceLastRequest < cooldownTime) {
+        const remainingCooldown = Math.ceil((cooldownTime - timeSinceLastRequest) / 1000);
+        console.log('⏰ [SERVER] Pomodoro suggestion cooldown active:', {
+          requestId,
+          sessionId: sessionId.substring(0, 8) + '...',
+          eventTitle: primaryEvent.title,
+          timeUntilEvent: primaryEvent.timeUntilEvent,
+          timeBucket: timeBucket,
+          remainingCooldown: `${remainingCooldown}s`,
+          timeSinceLastRequest: `${Math.round(timeSinceLastRequest / 1000)}s`
+        });
+
+        return res.status(429).json({
+          error: 'Pomodoro suggestion cooldown',
+          message: `Please wait ${remainingCooldown} seconds before requesting another Pomodoro suggestion for this event`,
+          remainingCooldown
+        });
+      }
+    }
+
+    // Update cooldown timestamps
+    pomodoroCooldowns.set(cooldownKey, now);
+    sessionCooldowns.set(sessionId, now);
+
+    // Clean up old cooldowns (older than 1 hour)
+    for (const [key, timestamp] of pomodoroCooldowns.entries()) {
+      if (now - timestamp > 60 * 60 * 1000) {
+        pomodoroCooldowns.delete(key);
+      }
+    }
+
+    // Clean up old session cooldowns (older than 1 hour)
+    for (const [key, timestamp] of sessionCooldowns.entries()) {
+      if (now - timestamp > 60 * 60 * 1000) {
+        sessionCooldowns.delete(key);
+      }
+    }
+  } else {
+    // Update session cooldown even if no events
+    sessionCooldowns.set(sessionId, now);
+  }
+
   console.log('🍅 [SERVER] Pomodoro suggestion request:', {
     requestId,
     sessionId: sessionId.substring(0, 8) + '...',
@@ -1920,7 +2217,7 @@ app.post('/api/ai/pomodoro-suggestion', aiLimiter, requireAuth, async (req, res)
     ip: req.ip,
     timestamp: new Date().toISOString()
   });
-  
+
   // Get session data
   const session = sessions.get(sessionId);
   if (!session) {
@@ -1956,13 +2253,13 @@ app.post('/api/ai/pomodoro-suggestion', aiLimiter, requireAuth, async (req, res)
   let prompt;
   if (initializeSession) {
     // First time - create and store system prompt
-    const languageName = userLanguage === 'zh' ? 'Chinese' : 
-                        userLanguage === 'ja' ? 'Japanese' : 
-                        userLanguage === 'ko' ? 'Korean' : 
-                        userLanguage === 'es' ? 'Spanish' : 
-                        userLanguage === 'fr' ? 'French' : 
-                        userLanguage === 'de' ? 'German' : 'English';
-    
+    const languageName = userLanguage === 'zh' ? 'Chinese' :
+      userLanguage === 'ja' ? 'Japanese' :
+        userLanguage === 'ko' ? 'Korean' :
+          userLanguage === 'es' ? 'Spanish' :
+            userLanguage === 'fr' ? 'French' :
+              userLanguage === 'de' ? 'German' : 'English';
+
     const systemPrompt = `You are a helpful productivity assistant. The user speaks ${languageName}. Respond in the same language.
 
 You help users optimize their Pomodoro work sessions based on their upcoming calendar events. You suggest:
@@ -1978,13 +2275,20 @@ Always respond in JSON format:
   "breakDuration": number,
   "focus": "What to focus on",
   "preparation": "Brief prep tips"
-}`;
+}
+
+CRITICAL RULES:
+- ALWAYS write human-readable, friendly messages in the "message" field
+- NEVER include technical jargon, JSON code, or system messages in the "message" field
+- Write messages as if talking to a friend - natural, encouraging, and conversational
+- Keep messages concise but motivating
+- Use the user's language (${languageName})`;
 
     // Store system prompt in session
     session.pomodoroSystemPrompt = systemPrompt;
     sessions.set(sessionId, session);
     await saveSessions();
-    
+
     console.log('🔄 [SERVER] Pomodoro system prompt initialized for session:', {
       requestId,
       sessionId: sessionId.substring(0, 8) + '...',
@@ -2026,17 +2330,26 @@ Suggest optimal Pomodoro strategy:`;
     promptLength: prompt.length,
     promptPreview: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : ''),
     isInitialized: !initializeSession,
-    model: 'gemini-2.0-flash-exp'
+    model: GLOBAL_MODEL_CONFIG.getCurrentModel()
   });
-  
+
   try {
     const aiStartTime = Date.now();
-    const data = await geminiGenerateContent({ model: 'gemini-2.0-flash-exp', prompt });
+    const modelResult = await callModel({
+      model: GLOBAL_MODEL_CONFIG.getCurrentModel(),
+      currentMessage: prompt,
+      sessionId: sessionId,
+      options: {
+        enableModelSwitching: true,
+        enableCompaction: false // No conversation history for this call
+      }
+    });
+    const data = modelResult.data;
     const aiEndTime = Date.now();
     const responseTime = aiEndTime - aiStartTime;
-    
+
     const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
+
     console.log('✅ [SERVER] Pomodoro suggestion received:', {
       requestId,
       sessionId: sessionId.substring(0, 8) + '...',
@@ -2044,7 +2357,7 @@ Suggest optimal Pomodoro strategy:`;
       responseTime: `${responseTime}ms`,
       timestamp: new Date().toISOString()
     });
-    
+
     // Log the full AI response
     console.log('🤖 [SERVER] AI Response received:', {
       requestId,
@@ -2052,7 +2365,7 @@ Suggest optimal Pomodoro strategy:`;
       responsePreview: aiResponse.substring(0, 500) + (aiResponse.length > 500 ? '...' : ''),
       fullResponse: aiResponse
     });
-    
+
     // Try to parse the response as JSON
     let suggestion;
     try {
@@ -2067,16 +2380,16 @@ Suggest optimal Pomodoro strategy:`;
       if (cleanResponse.endsWith('```')) {
         cleanResponse = cleanResponse.replace(/```$/, '').trim();
       }
-      
+
       console.log('🔧 [SERVER] Attempting to parse AI response:', {
         requestId,
         originalResponseLength: aiResponse.length,
         cleanedResponseLength: cleanResponse.length,
         cleanedResponsePreview: cleanResponse.substring(0, 300) + (cleanResponse.length > 300 ? '...' : '')
       });
-      
+
       suggestion = JSON.parse(cleanResponse);
-      
+
       console.log('✅ [SERVER] Pomodoro suggestion parsed successfully:', {
         requestId,
         sessionId: sessionId.substring(0, 8) + '...',
@@ -2088,7 +2401,7 @@ Suggest optimal Pomodoro strategy:`;
         preparation: suggestion.preparation,
         parsedSuggestion: suggestion
       });
-      
+
       res.json(suggestion);
     } catch (parseError) {
       console.error('❌ [SERVER] Failed to parse Pomodoro suggestion as JSON:', {
@@ -2100,12 +2413,12 @@ Suggest optimal Pomodoro strategy:`;
         cleanedResponse: cleanResponse,
         timestamp: new Date().toISOString()
       });
-      
+
       // Return a fallback suggestion
-      const upcomingEventInfo = upcomingEvents?.length > 0 ? 
-        `${upcomingEvents[0].title} in ${upcomingEvents[0].timeUntilEvent || 5} minutes` : 
+      const upcomingEventInfo = upcomingEvents?.length > 0 ?
+        `${upcomingEvents[0].title} in ${upcomingEvents[0].timeUntilEvent || 5} minutes` :
         'upcoming event';
-      
+
       const fallbackSuggestion = {
         message: `You have ${upcomingEvents?.length || 1} upcoming event(s) in the next 5 minutes. Perfect time for a focused Pomodoro session! 🍅`,
         sessions: 1,
@@ -2117,12 +2430,12 @@ Suggest optimal Pomodoro strategy:`;
         preparation: 'Take a moment to organize your thoughts and materials',
         upcomingEvent: upcomingEventInfo
       };
-      
+
       console.log('🔄 [SERVER] Returning fallback suggestion due to parse error:', {
         requestId,
         fallbackSuggestion
       });
-      
+
       res.json(fallbackSuggestion);
     }
   } catch (error) {
@@ -2136,12 +2449,12 @@ Suggest optimal Pomodoro strategy:`;
       ip: req.ip,
       timestamp: new Date().toISOString()
     });
-    
+
     // Return a fallback suggestion
-    const upcomingEventInfo = upcomingEvents?.length > 0 ? 
-      `${upcomingEvents[0].title} in ${upcomingEvents[0].timeUntilEvent || 5} minutes` : 
+    const upcomingEventInfo = upcomingEvents?.length > 0 ?
+      `${upcomingEvents[0].title} in ${upcomingEvents[0].timeUntilEvent || 5} minutes` :
       'upcoming event';
-    
+
     const fallbackSuggestion = {
       message: `You have ${upcomingEvents?.length || 1} upcoming event(s) in the next 5 minutes. Would you like to start a Pomodoro work session?`,
       sessions: 1,
@@ -2153,14 +2466,14 @@ Suggest optimal Pomodoro strategy:`;
       preparation: 'Take a moment to organize your thoughts',
       upcomingEvent: upcomingEventInfo
     };
-    
+
     console.log('🔄 [SERVER] Returning fallback suggestion due to API error:', {
       requestId,
       fallbackSuggestion
     });
-    
+
     res.json(fallbackSuggestion);
-    }
+  }
 });
 
 // Update calendar event
@@ -2168,7 +2481,7 @@ app.put('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
   const { eventId } = req.params;
   const { title, description, startTime, endTime, location, attendees, reminders } = req.body;
   const sessionId = req.headers['x-session-id'];
-  
+
   console.log('🔄 [SERVER] Updating calendar event:', {
     sessionId: sessionId.substring(0, 8) + '...',
     eventId,
@@ -2179,7 +2492,7 @@ app.put('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
     attendeesCount: attendees?.length || 0,
     ip: req.ip
   });
-  
+
   try {
     const event = {
       summary: title,
@@ -2202,35 +2515,35 @@ app.put('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
         })) : []
       }
     };
-    
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     console.log('🌐 [SERVER] Making Google Calendar API call to update event...', {
       sessionId: sessionId.substring(0, 8) + '...',
       calendarId: 'primary',
       eventId,
       eventSummary: event.summary
     });
-    
+
     const response = await calendar.events.update({
       calendarId: 'primary',
       eventId: eventId,
       resource: event,
       sendUpdates: 'all'
     });
-    
+
     console.log('✅ [SERVER] Google Calendar API event updated:', {
       sessionId: sessionId.substring(0, 8) + '...',
       eventId: response.data.id,
       eventSummary: response.data.summary,
       htmlLink: response.data.htmlLink
     });
-    
+
     res.json({
       success: true,
       event: response.data
     });
-    
+
   } catch (error) {
     console.error('❌ [SERVER] Update event error:', {
       error: error.message,
@@ -2247,14 +2560,14 @@ app.put('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
 // Google Calendar webhook endpoint for real-time notifications
 app.post('/api/calendar/webhook/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
-  
+
   console.log('🔄 [SERVER] Received Google Calendar webhook:', {
     sessionId: sessionId.substring(0, 8) + '...',
     headers: req.headers,
     body: req.body,
     ip: req.ip
   });
-  
+
   try {
     // Verify this is a valid Google Calendar webhook
     const subscription = watchSubscriptions.get(sessionId);
@@ -2262,10 +2575,10 @@ app.post('/api/calendar/webhook/:sessionId', async (req, res) => {
       console.log('⚠️ [SERVER] No active subscription found for webhook:', sessionId.substring(0, 8) + '...');
       return res.status(404).json({ error: 'Subscription not found' });
     }
-    
+
     // Handle different types of notifications
     const { state, resourceId, resourceUri } = req.body;
-    
+
     if (state === 'exists') {
       // Calendar events have changed, notify connected clients
       console.log('📅 [SERVER] Calendar events changed, notifying clients:', {
@@ -2273,15 +2586,15 @@ app.post('/api/calendar/webhook/:sessionId', async (req, res) => {
         resourceId,
         resourceUri
       });
-      
+
       // Here you would typically send a WebSocket message to connected clients
       // For now, we'll just log the change
       console.log('🔄 [SERVER] Calendar events updated, clients should refresh');
     }
-    
+
     // Always respond with 200 to acknowledge receipt
     res.status(200).json({ received: true });
-    
+
   } catch (error) {
     console.error('❌ [SERVER] Webhook processing error:', {
       sessionId: sessionId.substring(0, 8) + '...',
@@ -2292,41 +2605,74 @@ app.post('/api/calendar/webhook/:sessionId', async (req, res) => {
 });
 
 // Delete calendar event
-app.delete('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
+app.delete('/api/calendar/events/:eventId', requireAuth, calendarEventLimiter, async (req, res) => {
   const { eventId } = req.params;
   const sessionId = req.headers['x-session-id'];
-  
+  const { confirmed } = req.query; // Check if user confirmed the deletion
+
   console.log('🔄 [SERVER] Deleting calendar event:', {
     sessionId: sessionId.substring(0, 8) + '...',
     eventId,
+    confirmed: confirmed === 'true',
     ip: req.ip
   });
-  
+
+  // Check if deletion is confirmed
+  if (confirmed !== 'true') {
+    return res.status(400).json({
+      error: 'Deletion not confirmed',
+      message: 'Please confirm the deletion before proceeding'
+    });
+  }
+
   try {
+    // Enforce rate limiting before making API call
+    await enforceCalendarRateLimit(sessionId, 'delete');
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     console.log('🌐 [SERVER] Making Google Calendar API call to delete event...', {
       sessionId: sessionId.substring(0, 8) + '...',
       calendarId: 'primary',
       eventId
     });
-    
-    await calendar.events.delete({
-      calendarId: 'primary',
-      eventId: eventId,
-      sendUpdates: 'all'
-    });
-    
+
+    // Retry logic for rate limiting with better backoff
+    let retryCount = 0;
+    const maxRetries = 5; // Increased retries
+    const baseDelay = 2000; // 2 seconds base delay
+
+    while (retryCount <= maxRetries) {
+      try {
+        await calendar.events.delete({
+          calendarId: 'primary',
+          eventId: eventId,
+          sendUpdates: 'all'
+        });
+        break; // Success, exit retry loop
+      } catch (error) {
+        if (error.code === 429 && retryCount < maxRetries) {
+          // Exponential backoff with jitter: 2s, 4s, 8s, 16s, 32s
+          const delay = baseDelay * Math.pow(2, retryCount) + Math.random() * 1000;
+          console.log(`⏳ [SERVER] Rate limited, retrying in ${Math.round(delay)}ms (attempt ${retryCount + 1}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          retryCount++;
+        } else {
+          throw error; // Re-throw if not a 429 error or max retries reached
+        }
+      }
+    }
+
     console.log('✅ [SERVER] Google Calendar API event deleted:', {
       sessionId: sessionId.substring(0, 8) + '...',
       eventId
     });
-    
+
     res.json({
       success: true,
       message: 'Event deleted successfully'
     });
-    
+
   } catch (error) {
     console.error('❌ [SERVER] Delete event error:', {
       error: error.message,
@@ -2335,7 +2681,34 @@ app.delete('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
       eventId,
       ip: req.ip
     });
-    res.status(500).json({ error: 'Failed to delete calendar event' });
+
+    // Handle specific error cases
+    let errorMessage = 'Failed to delete calendar event';
+    let statusCode = 500;
+
+    if (error.code === 410) {
+      // Event was already deleted - this is actually a success case
+      errorMessage = 'Event was already deleted';
+      statusCode = 200;
+    } else if (error.code === 401) {
+      errorMessage = 'Authentication failed - please reconnect your Google Calendar';
+      statusCode = 401;
+    } else if (error.code === 403) {
+      errorMessage = 'Permission denied - check your Google Calendar permissions';
+      statusCode = 403;
+    } else if (error.code === 404) {
+      errorMessage = 'Event not found - it may have been deleted already';
+      statusCode = 404;
+    } else if (error.code === 429) {
+      errorMessage = 'Rate limit exceeded - please try again later';
+      statusCode = 429;
+    }
+
+    res.status(statusCode).json({
+      error: errorMessage,
+      details: error.message,
+      code: error.code
+    });
   }
 });
 
@@ -2343,22 +2716,22 @@ app.delete('/api/calendar/events/:eventId', requireAuth, async (req, res) => {
 async function findAvailableTimeSlots(constraints, oauth2Client) {
   try {
     const { startDate, endDate, duration, workingHours } = constraints;
-    
+
     console.log('🔄 [SERVER] Finding available time slots:', {
       startDate,
       endDate,
       duration,
       workingHours
     });
-    
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     // Get existing events in the date range
     console.log('🌐 [SERVER] Making Google Calendar API call to get existing events...', {
       timeMin: startDate,
       timeMax: endDate
     });
-    
+
     const response = await calendar.events.list({
       calendarId: 'primary',
       timeMin: startDate,
@@ -2366,47 +2739,47 @@ async function findAvailableTimeSlots(constraints, oauth2Client) {
       singleEvents: true,
       orderBy: 'startTime'
     });
-    
+
     const events = response.data.items || [];
-    
+
     console.log('✅ [SERVER] Existing events retrieved for time slot calculation:', {
       eventCount: events.length,
       timeRange: `${startDate} to ${endDate}`
     });
-    
+
     // Generate time slots and filter out busy times
     const timeSlots = [];
     const start = new Date(startDate);
     const end = new Date(endDate);
-    
+
     for (let date = new Date(start); date < end; date.setDate(date.getDate() + 1)) {
       const dayStart = new Date(date);
       dayStart.setHours(workingHours.start, 0, 0, 0);
-      
+
       const dayEnd = new Date(date);
       dayEnd.setHours(workingHours.end, 0, 0, 0);
-      
+
       for (let time = new Date(dayStart); time < dayEnd; time.setMinutes(time.getMinutes() + 30)) {
         const slotEnd = new Date(time.getTime() + duration * 60 * 1000);
-        
+
         // Check if slot conflicts with existing events
         const conflicts = events.some(event => {
           const eventStart = new Date(event.start.dateTime || event.start.date);
           const eventEnd = new Date(event.end.dateTime || event.end.date);
           return time < eventEnd && slotEnd > eventStart;
         });
-        
+
         if (!conflicts) {
           timeSlots.push(time.toISOString());
         }
       }
     }
-    
+
     console.log('✅ [SERVER] Available time slots calculated:', {
       totalSlots: timeSlots.length,
       dateRange: `${startDate} to ${endDate}`
     });
-    
+
     return timeSlots;
   } catch (error) {
     console.error('❌ [SERVER] Error finding time slots:', {
@@ -2445,4 +2818,402 @@ const server = app.listen(PORT, () => {
     console.error(`❌ [SERVER] Failed to start server:`, error.message);
   }
   process.exit(1);
-}); 
+});
+
+// Utility to estimate token usage (very rough, 1 token ≈ 4 chars for English)
+function estimateTokenCount(messages) {
+  return Math.ceil(messages.reduce((sum, msg) => {
+    const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    return sum + (contentStr?.length || 0);
+  }, 0) / 4);
+}
+
+// Unified model call function with automatic model switching
+async function callModel({
+  model,
+  conversationHistory = [],
+  currentMessage,
+  systemPrompt = null,
+  sessionId = null,
+  options = {}
+}) {
+  const {
+    maxRetries = 3,
+    baseDelay = 1000,
+    enableModelSwitching = true,
+    enableCompaction = true,
+    timeout = 25000
+  } = options;
+
+  // Get the model to use (session model or provided model)
+  let currentModel = model;
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId);
+    currentModel = session.preferredModel || model;
+  }
+
+  // Ensure we have a valid model
+  if (!currentModel) {
+    currentModel = GLOBAL_MODEL_CONFIG.primaryModel;
+  }
+
+  console.log('🤖 [SERVER] Unified model call:', {
+    requestedModel: model,
+    currentModel: currentModel,
+    sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
+    conversationHistoryLength: conversationHistory?.length || 0,
+    currentMessageLength: currentMessage?.length || 0,
+    enableModelSwitching,
+    enableCompaction
+  });
+
+  try {
+    // Use the existing geminiGenerateContent function
+    const result = await geminiGenerateContent({
+      model: currentModel,
+      conversationHistory,
+      currentMessage,
+      systemPrompt,
+      sessionId,
+      retryCount: 0,
+      fallbackAttempt: 0
+    });
+
+    return {
+      success: true,
+      data: result,
+      model: currentModel,
+      switched: false
+    };
+
+  } catch (error) {
+    console.error('❌ [SERVER] Model call failed:', {
+      model: currentModel,
+      error: error.message,
+      status: error.response?.status,
+      enableModelSwitching
+    });
+
+    // If model switching is disabled, throw the error
+    if (!enableModelSwitching) {
+      throw error;
+    }
+
+    // Try model switching
+    const fallbacks = GLOBAL_MODEL_CONFIG.fallbackModels;
+    const currentModelIndex = fallbacks.indexOf(currentModel);
+    const availableFallbacks = fallbacks.slice(currentModelIndex + 1);
+
+    if (availableFallbacks.length === 0) {
+      console.error('❌ [SERVER] No fallback models available');
+      throw error;
+    }
+
+    console.log('🔄 [SERVER] Attempting model switch:', {
+      fromModel: currentModel,
+      availableFallbacks: availableFallbacks.slice(0, 3),
+      fallbackCount: availableFallbacks.length
+    });
+
+    // Try each fallback model
+    for (let i = 0; i < availableFallbacks.length; i++) {
+      const fallbackModel = availableFallbacks[i];
+
+      try {
+        console.log(`🔄 [SERVER] Trying fallback model ${i + 1}/${availableFallbacks.length}: ${fallbackModel}`);
+
+        // Apply compaction if enabled and conversation is large
+        let optimizedHistory = conversationHistory;
+        if (enableCompaction && conversationHistory.length > 10) {
+          optimizedHistory = await compactConversationHistory(conversationHistory, {
+            useAI: true,
+            model: fallbackModel,
+            sessionId: sessionId
+          });
+        }
+
+        const result = await geminiGenerateContent({
+          model: fallbackModel,
+          conversationHistory: optimizedHistory,
+          currentMessage,
+          systemPrompt,
+          sessionId,
+          retryCount: 0,
+          fallbackAttempt: 0
+        });
+
+        // Update session's preferred model
+        if (sessionId && sessions.has(sessionId)) {
+          const session = sessions.get(sessionId);
+          session.preferredModel = fallbackModel;
+          sessions.set(sessionId, session);
+          await saveSessions();
+          console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${fallbackModel}`);
+        }
+
+        console.log(`✅ [SERVER] Model switch successful: ${currentModel} → ${fallbackModel}`);
+
+        return {
+          success: true,
+          data: result,
+          model: fallbackModel,
+          switched: true,
+          originalModel: currentModel
+        };
+
+      } catch (fallbackError) {
+        console.error(`❌ [SERVER] Fallback model ${fallbackModel} failed:`, fallbackError.message);
+
+        // If this is the last fallback, throw the original error
+        if (i === availableFallbacks.length - 1) {
+          throw error;
+        }
+      }
+    }
+
+    // If we get here, all fallbacks failed
+    throw error;
+  }
+}
+
+// Unified conversation history compaction utility with AI fallback
+const compactConversationHistory = async (conversationHistory, options = {}) => {
+  // Hard Gemini API limits (tokens/chars)
+  const HARD_CHAR_LIMIT = 30000;
+  const HARD_TOKEN_LIMIT = 8000;
+  const SAFE_CHAR_LIMIT = 0.9 * HARD_CHAR_LIMIT;
+  const SAFE_TOKEN_LIMIT = 0.9 * HARD_TOKEN_LIMIT;
+
+  // Find all pinned or important messages
+  const pinnedMessages = conversationHistory.filter(msg => msg.pinned || msg.important);
+
+  // Always preserve pinned/important and recent N messages
+  const preserveRecent = options.preserveRecent || 12;
+  const recentMessages = conversationHistory.slice(-preserveRecent);
+
+  // Build initial preserved set
+  let preserved = [];
+  pinnedMessages.forEach(msg => {
+    if (!preserved.includes(msg)) preserved.push(msg);
+  });
+  recentMessages.forEach(msg => {
+    if (!preserved.includes(msg)) preserved.push(msg);
+  });
+
+  // Remove duplicates
+  const seen = new Set();
+  preserved = preserved.filter(msg => {
+    // Use role + content hash for deduplication
+    const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    const key = `${msg.role}:${contentStr.substring(0, 100)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // If under safe limits, return full history
+  const totalChars = conversationHistory.reduce((sum, msg) => {
+    const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    return sum + (contentStr?.length || 0);
+  }, 0);
+  const totalTokens = estimateTokenCount(conversationHistory);
+  if (totalChars < SAFE_CHAR_LIMIT && totalTokens < SAFE_TOKEN_LIMIT) {
+    return conversationHistory;
+  }
+
+  // If over safe limits, try traditional compaction first
+  let compacted = [...preserved];
+  // Add as many older messages as possible (oldest first, not already preserved)
+  for (const msg of conversationHistory) {
+    if (!compacted.includes(msg) && !msg.pinned && !msg.important) {
+      compacted.push(msg);
+      const chars = compacted.reduce((sum, m) => {
+        const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+        return sum + (contentStr?.length || 0);
+      }, 0);
+      const tokens = estimateTokenCount(compacted);
+      if (chars > HARD_CHAR_LIMIT || tokens > HARD_TOKEN_LIMIT) {
+        compacted.pop();
+        break;
+      }
+    }
+  }
+
+  // Final check: if still over, trim oldest non-pinned until under limit
+  while (compacted.length > 0 && (compacted.reduce((sum, m) => {
+    const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    return sum + (contentStr?.length || 0);
+  }, 0) > HARD_CHAR_LIMIT || estimateTokenCount(compacted) > HARD_TOKEN_LIMIT)) {
+    // Remove oldest non-pinned, non-important
+    const idx = compacted.findIndex(msg => !msg.pinned && !msg.important);
+    if (idx === -1) break;
+    compacted.splice(idx, 1);
+  }
+
+  // Only compact if actually over limits
+  if (totalChars < SAFE_CHAR_LIMIT && totalTokens < SAFE_TOKEN_LIMIT) {
+    return conversationHistory;
+  }
+
+  // If over limits, prefer AI-assisted compaction when available and enabled
+  if (options.useAI !== false && options.model && options.sessionId) {
+    console.log('🤖 [SERVER] Context too large, attempting AI-assisted compaction...');
+
+    try {
+      const compactPrompt = `The following conversation history is too long for the AI model to process efficiently.
+
+Please summarize or compact the conversation, preserving all important user requests, assistant responses, and any context needed for future scheduling or actions.
+
+Output the compacted conversation as a JSON array of messages, each with a role ('user' or 'model') and content. Do not include any explanation or extra text.`;
+
+      const compactInput = [
+        { role: 'user', content: compactPrompt },
+        ...conversationHistory
+      ];
+
+      const modelResult = await callModel({
+        model: options.model,
+        conversationHistory: compactInput,
+        currentMessage: '',
+        sessionId: options.sessionId,
+        options: {
+          enableModelSwitching: true,
+          enableCompaction: false // No need for compaction during compaction
+        }
+      });
+      const response = modelResult.data;
+
+      const aiText = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+      // Try to parse JSON array from AI response with robust parsing
+      let aiCompactedHistory = null;
+      try {
+        // First, try to extract JSON array from the response
+        const jsonArrayMatch = aiText.match(/\[\s*\{[\s\S]*\}\s*\]/);
+        if (jsonArrayMatch) {
+          aiCompactedHistory = JSON.parse(jsonArrayMatch[0]);
+        } else {
+          // Try to find any JSON structure
+          const jsonMatch = aiText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            // If it's an object, try to extract messages array
+            if (typeof parsed === 'object' && !Array.isArray(parsed)) {
+              aiCompactedHistory = parsed.messages || parsed.conversation || parsed.history;
+            } else if (Array.isArray(parsed)) {
+              aiCompactedHistory = parsed;
+            }
+          } else {
+            // Last resort: try to parse the entire text
+            aiCompactedHistory = JSON.parse(aiText);
+          }
+        }
+
+
+
+        // Validate that the parsed result is a valid conversation history
+        if (!Array.isArray(aiCompactedHistory) || aiCompactedHistory.length === 0) {
+          throw new Error('AI response is not a valid conversation history array');
+        }
+
+        // Validate each message has required fields
+        const validMessages = aiCompactedHistory.filter(msg =>
+          msg && typeof msg === 'object' &&
+          (msg.role === 'user' || msg.role === 'model') &&
+          msg.content
+        );
+
+        if (validMessages.length === 0) {
+          throw new Error('No valid messages found in AI response');
+        }
+
+        aiCompactedHistory = validMessages;
+
+        const aiCompactedChars = aiCompactedHistory.reduce((sum, m) => {
+          const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+          return sum + (contentStr?.length || 0);
+        }, 0);
+        const aiCompactedTokens = estimateTokenCount(aiCompactedHistory);
+
+        console.log('✅ [SERVER] AI-assisted compaction successful:', {
+          originalLength: conversationHistory.length,
+          aiCompactedLength: aiCompactedHistory.length,
+          originalChars: totalChars,
+          aiCompactedChars: aiCompactedChars,
+          originalTokens: totalTokens,
+          aiCompactedTokens: aiCompactedTokens,
+          pinnedCount: pinnedMessages.length
+        });
+
+        return aiCompactedHistory;
+      } catch (err) {
+        console.error('❌ [SERVER] Failed to parse AI-compacted history:', {
+          error: err.message,
+          errorType: err.constructor.name,
+          aiTextLength: aiText.length,
+          aiTextPreview: aiText.substring(0, 500) + '...',
+          fullAiText: aiText
+        });
+        // Fall back to traditional compaction
+      }
+    } catch (err) {
+      console.error('❌ [SERVER] AI-assisted compaction failed:', err);
+      // Fall back to traditional compaction
+    }
+  }
+
+  // Fall back to traditional compaction if AI fails or is disabled
+  const compactedChars = compacted.reduce((sum, m) => {
+    const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    return sum + (contentStr?.length || 0);
+  }, 0);
+  const compactedTokens = estimateTokenCount(compacted);
+
+  // Only log when actual compaction occurs (reduced size)
+  if (compacted.length < conversationHistory.length) {
+    console.log('📝 [SERVER] Using traditional compaction (AI failed or disabled):', {
+      originalLength: conversationHistory.length,
+      compactedLength: compacted.length,
+      originalChars: totalChars,
+      compactedChars: compactedChars,
+      originalTokens: totalTokens,
+      compactedTokens: compactedTokens,
+      pinnedCount: pinnedMessages.length
+    });
+  }
+
+  return compacted;
+};
+
+// Patch geminiGenerateContent error handling for auto-compaction fallback
+const originalGeminiGenerateContent = geminiGenerateContent;
+geminiGenerateContent = async function patchedGeminiGenerateContent(args) {
+  try {
+    return await originalGeminiGenerateContent(args);
+  } catch (error) {
+    // Only fallback on size/token/timeout errors
+    const isSizeError = error?.response?.status === 400 || error?.response?.status === 413 || (error.message && error.message.toLowerCase().includes('token'));
+    const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.toLowerCase().includes('timeout'));
+    if ((isSizeError || isTimeout) && args.conversationHistory && args.conversationHistory.length > 0) {
+      console.warn('🤖 [SERVER] Triggering unified compaction fallback...');
+      const compacted = await compactConversationHistory(args.conversationHistory, {
+        model: args.model,
+        sessionId: args.sessionId,
+        useAI: true
+      });
+      if (compacted && compacted.length > 0) {
+        // Update session with compacted history (no notification message)
+        if (args.sessionId && sessions.has(args.sessionId)) {
+          const session = sessions.get(args.sessionId);
+          session.conversationHistory = compacted;
+          sessions.set(args.sessionId, session);
+          await saveSessions();
+          console.log('💾 [SERVER] Session updated with compacted history (no notification message)');
+        }
+        // Retry original request with compacted history
+        return await originalGeminiGenerateContent({ ...args, conversationHistory: compacted });
+      }
+    }
+    throw error;
+  }
+};

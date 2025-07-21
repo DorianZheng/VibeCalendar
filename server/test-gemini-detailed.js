@@ -41,7 +41,7 @@ async function testGeminiDetailed() {
     // Test 2: Try a simple generation request
     console.log('\n🤖 Test 2: Simple generation request...');
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${geminiApiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${geminiApiKey}`;
       const body = {
         contents: [
           { parts: [{ text: "Say 'Hello World'" }] }
@@ -88,7 +88,7 @@ async function testGeminiDetailed() {
     console.log('API Key format:', geminiApiKey.startsWith('AIza') ? 'Valid format' : 'Unexpected format');
     
     // Try different models
-    const models = ['gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-pro'];
+    const models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-1.5-pro'];
     for (const model of models) {
       console.log(`\n🧪 Testing model: ${model}`);
       try {

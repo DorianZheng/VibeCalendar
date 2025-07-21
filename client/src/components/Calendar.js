@@ -33,7 +33,9 @@ const Calendar = () => {
     getEventsForDate,
     hasEventsOnDate,
     setCurrentDate,
-    setSelectedDate
+    setSelectedDate,
+    sessionId,
+    sessionValidated
   } = useCalendar();
 
   const [viewMode, setViewMode] = useState('month');
@@ -46,28 +48,24 @@ const Calendar = () => {
     
     // Only fetch if we haven't fetched in the last 30 seconds
     if (!lastFetch || (now - lastFetch) > 30000) {
-      console.log('🔄 [CALENDAR] Fetching events for month:', format(currentDate, 'MMMM yyyy'));
       setLastFetchDate(now);
       await fetchEvents();
-    } else {
-      console.log('⏳ [CALENDAR] Skipping fetch - too soon since last request');
     }
-  }, [fetchEvents, currentDate, lastFetchDate]);
+  }, [fetchEvents, lastFetchDate]);
 
   useEffect(() => {
     // Only fetch if we have events and the month has changed significantly
-    if (events.length > 0) {
+    if (events.length > 0 && sessionId && sessionValidated) {
       debouncedFetchEvents();
     }
-  }, [debouncedFetchEvents]);
+  }, [debouncedFetchEvents, events.length, sessionId, sessionValidated]);
 
   // Initial fetch when component mounts
   useEffect(() => {
-    if (events.length === 0) {
-      console.log('🔄 [CALENDAR] Initial fetch for calendar view');
+    if (events.length === 0 && sessionId && sessionValidated) {
       fetchEvents();
     }
-  }, []); // Only run once on mount
+  }, [events.length, sessionId, sessionValidated]); // Only run when session is ready
 
   const goToPreviousMonth = () => {
     setCurrentDate(subMonths(currentDate, 1));

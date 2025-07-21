@@ -58,16 +58,16 @@ const calendarReducer = (state, action) => {
     case 'ADD_EVENT':
       return { ...state, events: [...state.events, action.payload] };
     case 'UPDATE_EVENT':
-      return { 
-        ...state, 
-        events: state.events.map(event => 
+      return {
+        ...state,
+        events: state.events.map(event =>
           event.id === action.payload.id ? action.payload : event
-        ) 
+        )
       };
     case 'DELETE_EVENT':
-      return { 
-        ...state, 
-        events: state.events.filter(event => event.id !== action.payload) 
+      return {
+        ...state,
+        events: state.events.filter(event => event.id !== action.payload)
       };
     case 'SET_AI_SUGGESTIONS':
       return { ...state, aiSuggestions: action.payload };
@@ -102,35 +102,21 @@ const getSessionFromStorage = () => {
   try {
     const sessionId = localStorage.getItem('vibeCalendar_sessionId');
     const connectedAt = localStorage.getItem('vibeCalendar_connectedAt');
-    
-    console.log('🔍 [STORAGE] Reading from localStorage:', {
-      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-      connectedAt: connectedAt || 'none'
-    });
-    
+
     if (sessionId && connectedAt) {
       // Check if session is not too old (7 days)
       const connectedDate = new Date(connectedAt);
       const now = new Date();
       const daysDiff = (now - connectedDate) / (1000 * 60 * 60 * 24);
-      
-      console.log('🔍 [STORAGE] Session age check:', {
-        connectedDate: connectedDate.toISOString(),
-        now: now.toISOString(),
-        daysDiff: daysDiff.toFixed(2)
-      });
-      
+
       if (daysDiff < 7) {
-        console.log('✅ [STORAGE] Session is valid (age check passed)');
         return sessionId;
       } else {
         // Session is too old, clear it
-        console.log('⚠️ [STORAGE] Session is too old, clearing it');
         clearSessionFromStorage();
         return null;
       }
     }
-    console.log('❌ [STORAGE] No session data found in localStorage');
     return null;
   } catch (error) {
     console.error('❌ [STORAGE] Failed to get session from localStorage:', error);
@@ -140,10 +126,8 @@ const getSessionFromStorage = () => {
 
 const clearSessionFromStorage = () => {
   try {
-    console.log('🧹 [STORAGE] Clearing session from localStorage');
     localStorage.removeItem('vibeCalendar_sessionId');
     localStorage.removeItem('vibeCalendar_connectedAt');
-    console.log('✅ [STORAGE] Session cleared from localStorage');
   } catch (error) {
     console.error('❌ [STORAGE] Failed to clear session from localStorage:', error);
   }
@@ -160,27 +144,23 @@ export const CalendarProvider = ({ children }) => {
     const now = Date.now();
     const lastCall = lastApiCall[endpoint] || 0;
     const minInterval = 1000; // 1 second minimum between calls to same endpoint
-    
+
     if (now - lastCall < minInterval) {
-      console.log(`⏳ [CLIENT] Rate limit: ${endpoint} called too frequently`);
       return false;
     }
-    
+
     if (rateLimitCooldown) {
-      console.log(`⏳ [CLIENT] Rate limit cooldown active, skipping ${endpoint}`);
       return false;
     }
-    
+
     setLastApiCall(prev => ({ ...prev, [endpoint]: now }));
     return true;
   };
 
   // Handle rate limiting
   const handleRateLimit = () => {
-    console.log('⏳ [CLIENT] Rate limit detected, entering cooldown mode');
     setRateLimitCooldown(true);
     setTimeout(() => {
-      console.log('✅ [CLIENT] Rate limit cooldown expired');
       setRateLimitCooldown(false);
     }, 30000); // 30 second cooldown
   };
@@ -188,55 +168,45 @@ export const CalendarProvider = ({ children }) => {
   // Restore session from localStorage on mount
   useEffect(() => {
     const savedSessionId = getSessionFromStorage();
-    
+
     if (savedSessionId && !isValidatingSession) {
-      console.log('🔄 [CONTEXT] Restoring session from localStorage:', savedSessionId.substring(0, 8) + '...');
       // Set the session ID immediately to ensure axios headers are set
       dispatch({ type: 'SET_SESSION_ID', payload: savedSessionId });
       // Add a small delay to prevent race conditions during page load
       setTimeout(() => {
         validateSession(savedSessionId);
       }, 100);
-    } else if (!savedSessionId) {
-      console.log('🔄 [CONTEXT] No saved session found in localStorage');
-    } else {
-      console.log('🔄 [CONTEXT] Session validation already in progress, skipping');
     }
   }, []); // Only run once on mount
 
   // Validate session by making a test request
   const validateSession = async (sessionId) => {
     if (isValidatingSession) {
-      console.log('⏳ [CONTEXT] Session validation already in progress, skipping');
       return;
     }
-    
+
     setIsValidatingSession(true);
     // Set sessionValidated to false while validating
     dispatch({ type: 'SET_SESSION_VALIDATED', payload: false });
-    
+
     let retryCount = 0;
     const maxRetries = 3;
-    
+
     while (retryCount <= maxRetries) {
       try {
-        console.log('🔄 [CONTEXT] Validating session...', sessionId.substring(0, 8) + '...', retryCount > 0 ? `(retry ${retryCount})` : '');
-        
         // Use the dedicated session validation endpoint instead of calendar events
         const response = await axios.get('/api/auth/session', {
           headers: { 'x-session-id': sessionId },
           timeout: 10000 // 10 second timeout
         });
-        
+
         if (response.data.valid) {
           // Session is valid, ensure it's set in state
           dispatch({ type: 'SET_SESSION_ID', payload: sessionId });
-          console.log('✅ [CONTEXT] Session validated successfully');
           setIsValidatingSession(false);
           return;
         } else {
           // Session is invalid, clear it
-          console.log('❌ [CONTEXT] Session validation failed:', response.data.message);
           dispatch({ type: 'CLEAR_SESSION' });
           clearSessionFromStorage();
           setIsValidatingSession(false);
@@ -244,27 +214,20 @@ export const CalendarProvider = ({ children }) => {
         }
       } catch (error) {
         retryCount++;
-        console.log(`❌ [CONTEXT] Session validation failed (attempt ${retryCount}):`, {
-          status: error.response?.status,
-          message: error.message,
-          code: error.code
-        });
-        
+
         if (retryCount > maxRetries) {
           // Final attempt failed, clear session
-          console.log('❌ [CONTEXT] Max retries reached, clearing session');
           dispatch({ type: 'CLEAR_SESSION' });
           clearSessionFromStorage();
           break;
         }
-        
+
         // Wait before retrying (exponential backoff)
         const waitTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-        console.log(`⏳ [CONTEXT] Waiting ${waitTime}ms before retry...`);
         await new Promise(resolve => setTimeout(resolve, waitTime));
       }
     }
-    
+
     setIsValidatingSession(false);
   };
 
@@ -280,7 +243,6 @@ export const CalendarProvider = ({ children }) => {
   // Fetch events from Google Calendar - memoized to prevent infinite loops
   const fetchEvents = useCallback(async (startDate, endDate, showLoading = true) => {
     if (!state.sessionId) {
-      console.log('No session ID, skipping event fetch');
       return;
     }
 
@@ -290,29 +252,17 @@ export const CalendarProvider = ({ children }) => {
     }
 
     try {
-      console.log('🔄 [CLIENT] Fetching calendar events...', {
-        sessionId: state.sessionId.substring(0, 8) + '...',
-        timeMin: startDate ? startDate.toISOString() : new Date().toISOString(),
-        timeMax: endDate ? endDate.toISOString() : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-        showLoading
-      });
-      
       if (showLoading) {
         dispatch({ type: 'SET_LOADING', payload: true });
       }
-      
+
       const timeMin = startDate ? startDate.toISOString() : new Date().toISOString();
       const timeMax = endDate ? endDate.toISOString() : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      
+
       const response = await axios.get('/api/calendar/events', {
         params: { timeMin, timeMax }
       });
-      
-      console.log('✅ [CLIENT] Calendar events fetched successfully', {
-        eventCount: response.data.items?.length || 0,
-        sessionId: state.sessionId.substring(0, 8) + '...'
-      });
-      
+
       dispatch({ type: 'SET_EVENTS', payload: response.data.items || [] });
       // Clear any previous errors on successful fetch
       if (state.error) {
@@ -325,7 +275,7 @@ export const CalendarProvider = ({ children }) => {
         sessionId: state.sessionId.substring(0, 8) + '...',
         url: error.config?.url
       });
-      
+
       if (error.response?.status === 401) {
         // Session is invalid, clear it
         console.log('🔐 [CLIENT] Session expired, clearing session');
@@ -383,14 +333,13 @@ export const CalendarProvider = ({ children }) => {
       console.log('✅ [CLIENT] OAuth callback received, setting session ID:', sessionId.substring(0, 8) + '...');
       dispatch({ type: 'SET_SESSION_ID', payload: sessionId });
       saveSessionToStorage(sessionId);
-      toast.success('Google Calendar connected successfully!');
     }
   };
 
   // Disconnect from Google Calendar
   const disconnectGoogleCalendar = async () => {
     console.log('🔌 [CLIENT] Disconnecting from Google Calendar');
-    
+
     try {
       // Call server logout endpoint to revoke session
       if (state.sessionId) {
@@ -400,17 +349,17 @@ export const CalendarProvider = ({ children }) => {
     } catch (error) {
       console.log('⚠️ [CLIENT] Server logout failed, but continuing with client cleanup:', error.message);
     }
-    
+
     // Clear client-side state regardless of server response
     dispatch({ type: 'CLEAR_SESSION' });
     clearSessionFromStorage();
-    toast.success('Disconnected from Google Calendar');
   };
 
   // Create new event
-  const createEvent = async (eventData) => {
+  const createEvent = async (eventData, options = {}) => {
+    const { skipRefresh = false, skipToast = false } = options;
     const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-    
+
     if (!state.sessionId) {
       console.log('❌ [CLIENT] Cannot create event: No session ID');
       toast.error('Please connect your Google Calendar first');
@@ -429,16 +378,18 @@ export const CalendarProvider = ({ children }) => {
         attendees: eventData.attendees,
         reminders: eventData.reminders,
         sessionId: state.sessionId.substring(0, 8) + '...',
-        fullEventData: eventData
+        fullEventData: eventData,
+        skipRefresh,
+        skipToast
       });
-      
+
       dispatch({ type: 'SET_LOADING', payload: true });
-      
+
       const apiStartTime = Date.now();
       const response = await axios.post('/api/calendar/events', eventData);
       const apiEndTime = Date.now();
       const responseTime = apiEndTime - apiStartTime;
-      
+
       console.log('✅ [CLIENT] Event created successfully', {
         requestId,
         eventId: response.data.event?.id,
@@ -447,13 +398,19 @@ export const CalendarProvider = ({ children }) => {
         responseTime: `${responseTime}ms`,
         responseData: response.data
       });
-      
+
       dispatch({ type: 'ADD_EVENT', payload: response.data.event });
-      toast.success('Event created successfully!');
-      
-      // Refresh events to ensure we have the latest data
-      setTimeout(() => fetchEvents(), 1000);
-      
+
+      // Only show toast and refresh if not skipped
+      if (!skipToast) {
+        toast.success('Event created successfully!');
+      }
+
+      // Refresh events to ensure we have the latest data (unless skipped)
+      if (!skipRefresh) {
+        setTimeout(() => fetchEvents(), 500);
+      }
+
       return response.data.event;
     } catch (error) {
       console.error('❌ [CLIENT] Error creating event:', {
@@ -470,7 +427,7 @@ export const CalendarProvider = ({ children }) => {
         errorStack: error.stack,
         timestamp: new Date().toISOString()
       });
-      
+
       if (error.response?.status === 401) {
         dispatch({ type: 'CLEAR_SESSION' });
         clearSessionFromStorage();
@@ -493,7 +450,7 @@ export const CalendarProvider = ({ children }) => {
   };
 
   // Get AI scheduling suggestions
-  const getAISuggestions = async (description, preferences, existingEvents) => {
+  const getAISuggestions = async (description, preferences) => {
     // Check rate limiting
     if (!checkRateLimit('getAISuggestions')) {
       throw new Error('Rate limited - please wait before making another request');
@@ -502,69 +459,127 @@ export const CalendarProvider = ({ children }) => {
     try {
       console.log('🔄 [CLIENT] Getting AI scheduling suggestions...', {
         description: description.substring(0, 50) + '...',
-        preferences: preferences.substring(0, 50) + '...',
-        existingEventsCount: existingEvents?.length || 0
+        preferences: preferences.substring(0, 50) + '...'
       });
-      
+
       dispatch({ type: 'SET_LOADING', payload: true });
-      
+
       // Get user's timezone
       const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      
+
       const response = await axios.post('/api/ai/schedule', {
         description,
         preferences,
-        existingEvents: existingEvents || state.events,
         timezone: userTimezone
       });
-      
+
       console.log('✅ [CLIENT] AI response received', {
-        actions: response.data.actions,
+        tools: response.data.tools,
         aiMessage: response.data.aiMessage,
         requiresConfirmation: response.data.requiresConfirmation,
-        actionResults: response.data.actionResults
+        toolResults: response.data.toolResults
       });
-      
-      // Handle multiple actions
-      if (response.data.actions && response.data.actions.length > 0) {
-        const actionResults = response.data.actionResults || [];
-        const hasConfirmationRequired = actionResults.some(r => r.requiresConfirmation);
-        
-        // Process successful actions
-        for (let i = 0; i < response.data.actions.length; i++) {
-          const action = response.data.actions[i];
-          const result = actionResults[i];
-          
+
+      // Handle multiple tools
+      if (response.data.tools && response.data.tools.length > 0) {
+        console.log('🔄 [CONTEXT] Processing AI tools response:', {
+          toolsCount: response.data.tools.length,
+          tools: response.data.tools,
+          toolResults: response.data.toolResults,
+          aiMessage: response.data.aiMessage?.substring(0, 100) + '...'
+        });
+
+        const toolResults = response.data.toolResults || [];
+        const hasConfirmationRequired = toolResults.some(r => r.requiresConfirmation);
+
+        // Track if we need to refresh events after processing all tools
+        let needsEventRefresh = false;
+        let createdEventCount = 0;
+
+        // Process successful tools
+        for (let i = 0; i < response.data.tools.length; i++) {
+          const tool = response.data.tools[i];
+          const result = toolResults[i];
+
+          console.log(`🔄 [CONTEXT] Processing tool ${i + 1}/${response.data.tools.length}:`, {
+            tool,
+            result: result ? {
+              success: result.success,
+              hasEvent: !!result.event,
+              eventId: result.event?.id,
+              eventTitle: result.event?.summary,
+              shouldRefreshEvents: result.shouldRefreshEvents,
+              message: result.message
+            } : 'No result'
+          });
+
           if (result?.success) {
-            if (action === 'create_event' && result.event) {
+            if (tool === 'create_event' && result.event) {
+              console.log('✅ [CONTEXT] Adding AI-created event to state:', {
+                eventId: result.event.id,
+                title: result.event.summary,
+                startTime: result.event.start?.dateTime || result.event.start?.date
+              });
               dispatch({ type: 'ADD_EVENT', payload: result.event });
-              toast.success(result.message || 'Event created successfully!');
-              // Refresh events to ensure we have the latest data
-              setTimeout(() => fetchEvents(), 1000);
-            } else if (action === 'query_events' && result.events) {
+              createdEventCount++;
+              needsEventRefresh = true;
+              // Don't show individual toasts for multiple events to avoid spam
+              if (response.data.tools.length === 1) {
+                toast.success(result.message || 'Event created successfully!');
+              }
+            } else if (tool === 'query_events' && result.events) {
               dispatch({ type: 'SET_EVENTS', payload: result.events });
-            } else if (action === 'update_event' && result.event) {
+            } else if (tool === 'update_event' && result.event) {
               dispatch({ type: 'UPDATE_EVENT', payload: result.event });
               toast.success(result.message || 'Event updated successfully!');
-              // Refresh events to ensure we have the latest data
-              setTimeout(() => fetchEvents(), 1000);
-            } else if (action === 'delete_event' && result.eventId) {
-              dispatch({ type: 'DELETE_EVENT', payload: result.eventId });
-              toast.success(result.message || 'Event deleted successfully!');
-              // Refresh events to ensure we have the latest data
-              setTimeout(() => fetchEvents(), 1000);
+              needsEventRefresh = true;
+            } else if (tool === 'delete_event' && (result.eventId || result.parameters?.eventId)) {
+              // For delete events, we don't delete immediately if confirmation is required
+              // The deletion will happen during confirmation
+              if (!result.requiresConfirmation) {
+                dispatch({ type: 'DELETE_EVENT', payload: result.eventId || result.parameters.eventId });
+                toast.success(result.message || 'Event deleted successfully!');
+                needsEventRefresh = true;
+              }
+            }
+
+            // Check if the backend indicates we should refresh events
+            if (result.shouldRefreshEvents) {
+              needsEventRefresh = true;
             }
           } else if (result && !result.success) {
-            toast.error(result.message || `Failed to ${action}`);
+            toast.error(result.message || `Failed to ${tool}`);
           }
         }
-        
-        // Return response with multiple actions
+
+        console.log('📊 [CONTEXT] Final tool processing summary:', {
+          totalTools: response.data.tools?.length || 0,
+          createdEventCount,
+          needsEventRefresh,
+          hasConfirmationRequired
+        });
+
+        if (needsEventRefresh) {
+          // Refresh events once after all events are processed
+          console.log('🔄 [CONTEXT] Refreshing events after AI tool execution:', {
+            toolCount: response.data.tools?.length || 0,
+            createdEventCount,
+            needsEventRefresh
+          });
+          setTimeout(() => {
+            console.log('🔄 [CONTEXT] Executing delayed event refresh');
+            fetchEvents();
+          }, 1500); // Increased delay to ensure Google Calendar API has propagated changes
+        } else {
+          console.log('ℹ️ [CONTEXT] No event refresh needed');
+        }
+
+        // Return response with multiple tools
         return {
           success: true,
           aiMessage: response.data.aiMessage,
-          actions: response.data.actions,
-          actionResults: actionResults,
+          tools: response.data.tools,
+          toolResults: toolResults,
           requiresConfirmation: hasConfirmationRequired
         };
       } else {
@@ -572,8 +587,8 @@ export const CalendarProvider = ({ children }) => {
         return {
           success: true,
           aiMessage: response.data.aiMessage,
-          actions: [],
-          actionResults: []
+          tools: [],
+          toolResults: []
         };
       }
     } catch (error) {
@@ -593,11 +608,11 @@ export const CalendarProvider = ({ children }) => {
         errorStack: error.stack,
         clientTimestamp: new Date().toISOString()
       });
-      
+
       // Provide more specific error messages based on the error type
       let errorMessage = 'Failed to get AI scheduling suggestions';
       let toastMessage = 'Failed to get AI scheduling suggestions';
-      
+
       if (error.response?.status === 429) {
         errorMessage = 'AI service rate limit exceeded';
         toastMessage = 'Too many requests. Please wait a moment and try again.';
@@ -614,58 +629,13 @@ export const CalendarProvider = ({ children }) => {
         errorMessage = error.response.data.error;
         toastMessage = error.response.data.details || error.response.data.error;
       }
-      
+
       dispatch({ type: 'SET_ERROR', payload: errorMessage });
       throw error;
     }
   };
 
-  // Smart scheduling with AI
-  const smartSchedule = async (description, preferences, constraints) => {
-    if (!state.sessionId) {
-      console.log('❌ [CLIENT] Cannot perform smart scheduling: No session ID');
-      toast.error('Please connect your Google Calendar first');
-      throw new Error('Not authenticated');
-    }
 
-    try {
-      console.log('🔄 [CLIENT] Performing smart scheduling...', {
-        description: description.substring(0, 50) + '...',
-        sessionId: state.sessionId.substring(0, 8) + '...'
-      });
-      
-      dispatch({ type: 'SET_LOADING', payload: true });
-      
-      const response = await axios.post('/api/ai/smart-schedule', {
-        description,
-        preferences,
-        constraints
-      });
-      
-      console.log('✅ [CLIENT] Smart scheduling completed', {
-        selectedTime: response.data.selectedTime,
-        sessionId: state.sessionId.substring(0, 8) + '...'
-      });
-      
-      return response.data;
-    } catch (error) {
-      console.error('❌ [CLIENT] Error with smart scheduling:', {
-        status: error.response?.status,
-        message: error.response?.data?.error || error.message,
-        description: description.substring(0, 50) + '...',
-        sessionId: state.sessionId.substring(0, 8) + '...',
-        url: error.config?.url
-      });
-      
-      if (error.response?.status === 401) {
-        dispatch({ type: 'CLEAR_SESSION' });
-        clearSessionFromStorage();
-      } else {
-        dispatch({ type: 'SET_ERROR', payload: 'Failed to perform smart scheduling' });
-      }
-      throw error;
-    }
-  };
 
   // Update event
   const updateEvent = async (eventId, eventData) => {
@@ -681,23 +651,23 @@ export const CalendarProvider = ({ children }) => {
         title: eventData.title,
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       dispatch({ type: 'SET_LOADING', payload: true });
-      
+
       const response = await axios.put(`/api/calendar/events/${eventId}`, eventData);
-      
+
       console.log('✅ [CLIENT] Event updated successfully', {
         eventId,
         title: response.data.event?.summary,
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       dispatch({ type: 'UPDATE_EVENT', payload: response.data.event });
       toast.success('Event updated successfully!');
-      
+
       // Refresh events to ensure we have the latest data
       setTimeout(() => fetchEvents(), 1000);
-      
+
       return response.data.event;
     } catch (error) {
       console.error('❌ [CLIENT] Error updating event:', {
@@ -707,7 +677,7 @@ export const CalendarProvider = ({ children }) => {
         sessionId: state.sessionId.substring(0, 8) + '...',
         url: error.config?.url
       });
-      
+
       if (error.response?.status === 401) {
         dispatch({ type: 'CLEAR_SESSION' });
         clearSessionFromStorage();
@@ -734,19 +704,20 @@ export const CalendarProvider = ({ children }) => {
         eventId,
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       dispatch({ type: 'SET_LOADING', payload: true });
-      
-      await axios.delete(`/api/calendar/events/${eventId}`);
-      
+
+      const response = await axios.delete(`/api/calendar/events/${eventId}?confirmed=true`);
+
       console.log('✅ [CLIENT] Event deleted successfully', {
         eventId,
-        sessionId: state.sessionId.substring(0, 8) + '...'
+        sessionId: state.sessionId.substring(0, 8) + '...',
+        message: response.data.message
       });
-      
+
       dispatch({ type: 'DELETE_EVENT', payload: eventId });
-      toast.success('Event deleted successfully!');
-      
+      toast.success(response.data.message || 'Event deleted successfully!');
+
       // Refresh events to ensure we have the latest data
       setTimeout(() => fetchEvents(), 1000);
     } catch (error) {
@@ -757,7 +728,7 @@ export const CalendarProvider = ({ children }) => {
         sessionId: state.sessionId.substring(0, 8) + '...',
         url: error.config?.url
       });
-      
+
       if (error.response?.status === 401) {
         dispatch({ type: 'CLEAR_SESSION' });
         clearSessionFromStorage();
@@ -776,47 +747,49 @@ export const CalendarProvider = ({ children }) => {
     dispatch({ type: 'CLEAR_AI_SUGGESTIONS' });
   };
 
-  // Confirm AI actions (for destructive actions like update/delete)
+  // Confirm AI tools (for destructive tools like update/delete)
   const confirmAIAction = async (actions, actionResults) => {
     if (!state.sessionId) {
-      console.log('❌ [CLIENT] Cannot confirm AI actions: No session ID');
+      console.log('❌ [CLIENT] Cannot confirm AI tools: No session ID');
       toast.error('Please connect your Google Calendar first');
       throw new Error('Not authenticated');
     }
 
     try {
-      console.log('🔄 [CLIENT] Confirming AI actions...', {
+      console.log('🔄 [CLIENT] Confirming AI tools...', {
         actions,
         actionResults,
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       dispatch({ type: 'SET_LOADING', payload: true });
-      
+
       const results = [];
-      
-      // Execute each action that requires confirmation
+
+      // Execute each tool that requires confirmation
       for (let i = 0; i < actions.length; i++) {
         const action = actions[i];
         const actionResult = actionResults[i];
-        
+
         if (actionResult.requiresConfirmation) {
           let result;
-          
+
           if (action === 'update_event') {
             const response = await axios.put(`/api/calendar/events/${actionResult.parameters.eventId}`, actionResult.parameters.event);
             result = response.data.event;
             dispatch({ type: 'UPDATE_EVENT', payload: result });
             toast.success('Event updated successfully!');
           } else if (action === 'delete_event') {
-            await axios.delete(`/api/calendar/events/${actionResult.parameters.eventId}`);
-            dispatch({ type: 'DELETE_EVENT', payload: actionResult.parameters.eventId });
-            toast.success('Event deleted successfully!');
+            // Get eventId from either parameters or the action result
+            const eventId = actionResult.parameters?.eventId || actionResult.eventId;
+            const response = await axios.delete(`/api/calendar/events/${eventId}?confirmed=true`);
+            dispatch({ type: 'DELETE_EVENT', payload: eventId });
+            toast.success(response.data.message || 'Event deleted successfully!');
             result = { deleted: true };
           } else {
             throw new Error(`Unknown action: ${action}`);
           }
-          
+
           results.push({
             action,
             success: true,
@@ -824,12 +797,23 @@ export const CalendarProvider = ({ children }) => {
           });
         }
       }
-      
+
+      // Refresh events after all confirmed actions are executed
+      // Make this silent - don't let fetchEvents failure affect AI response
+      setTimeout(async () => {
+        try {
+          await fetchEvents(undefined, undefined, false); // silent refresh
+        } catch (error) {
+          // Silently handle fetchEvents errors - don't let them affect AI response
+          console.log('⚠️ [CLIENT] Silent fetchEvents failed after AI operations:', error.message);
+        }
+      }, 2000);
+
       console.log('✅ [CLIENT] AI actions confirmed and executed:', {
         actions,
         results
       });
-      
+
       return {
         success: true,
         results
@@ -840,7 +824,7 @@ export const CalendarProvider = ({ children }) => {
         error: error.message,
         status: error.response?.status
       });
-      
+
       if (error.response?.status === 401) {
         dispatch({ type: 'CLEAR_SESSION' });
         clearSessionFromStorage();
@@ -871,16 +855,16 @@ export const CalendarProvider = ({ children }) => {
       console.log('🔄 [CLIENT] Fetching user information...', {
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       const response = await axios.get('/api/auth/user');
-      
+
       console.log('✅ [CLIENT] User information received:', {
         name: response.data.name,
         email: response.data.email.substring(0, 20) + '...',
         timezone: response.data.timezone,
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       dispatch({ type: 'SET_USER', payload: response.data });
       return response.data;
     } catch (error) {
@@ -889,7 +873,7 @@ export const CalendarProvider = ({ children }) => {
         message: error.response?.data?.error || error.message,
         sessionId: state.sessionId.substring(0, 8) + '...'
       });
-      
+
       // Don't clear session on user info fetch failure - it's not critical
       // Only log the error and continue
       console.log('⚠️ [CLIENT] User info fetch failed, but session remains valid');
@@ -912,7 +896,6 @@ export const CalendarProvider = ({ children }) => {
     updateEvent,
     deleteEvent,
     getAISuggestions,
-    smartSchedule,
     clearAISuggestions,
     confirmAIAction,
     getEventsForDate,

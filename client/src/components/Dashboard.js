@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { 
-  Calendar, 
-  Clock, 
+import {
+  Calendar,
+  Clock,
   Send,
   MessageCircle,
   Play,
@@ -10,11 +10,13 @@ import {
 } from 'lucide-react';
 import { useCalendar } from '../context/CalendarContext';
 import { format, isToday, isTomorrow } from 'date-fns';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 const Dashboard = () => {
-  const { 
-    events, 
-    fetchEvents, 
+  const {
+    events,
+    fetchEvents,
     getAISuggestions,
     createEvent,
     confirmAIAction,
@@ -26,13 +28,14 @@ const Dashboard = () => {
     fetchUserInfo,
     disconnectGoogleCalendar
   } = useCalendar();
-  
+
   const [chatMessages, setChatMessages] = useState([]);
   const [inputMessage, setInputMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [hasAttemptedFetch, setHasAttemptedFetch] = useState(false);
+  const [hasAttemptedUserFetch, setHasAttemptedUserFetch] = useState(false);
   const chatContainerRef = useRef(null);
-  
+
   // Pomodoro timer state
   const [pomodoroState, setPomodoroState] = useState('idle'); // idle, work, break
   const [timeLeft, setTimeLeft] = useState(25 * 60); // Default 25 minutes in seconds
@@ -44,14 +47,16 @@ const Dashboard = () => {
   const [showPomodoroNotification, setShowPomodoroNotification] = useState(false);
   const [pomodoroNotificationData, setPomodoroNotificationData] = useState(null);
   const [notifiedEvents, setNotifiedEvents] = useState(new Set()); // Track events that have triggered notifications
+  const [isChatVisible, setIsChatVisible] = useState(true);
   const [pomodoroSessionInitialized, setPomodoroSessionInitialized] = useState(false); // Track if system prompt was sent
+  const [lastEventCount, setLastEventCount] = useState(0); // Track event count for auto-refresh
   const pomodoroIntervalRef = useRef(null);
 
   // Language detection function
   const detectUserLanguage = () => {
     // Try to detect from browser language
     const browserLang = navigator.language || navigator.userLanguage;
-    
+
     // Try to detect from user's input messages
     const userMessages = chatMessages.filter(msg => msg.type === 'user');
     if (userMessages.length > 0) {
@@ -64,7 +69,7 @@ const Dashboard = () => {
       if (/[àâäéèêëïîôöùûüÿç]/.test(lastMessage)) return 'fr'; // French
       if (/[äöüß]/.test(lastMessage)) return 'de'; // German
     }
-    
+
     // Fallback to browser language
     if (browserLang.startsWith('zh')) return 'zh';
     if (browserLang.startsWith('ja')) return 'ja';
@@ -72,7 +77,7 @@ const Dashboard = () => {
     if (browserLang.startsWith('es')) return 'es';
     if (browserLang.startsWith('fr')) return 'fr';
     if (browserLang.startsWith('de')) return 'de';
-    
+
     return 'en'; // Default to English
   };
 
@@ -143,53 +148,55 @@ const Dashboard = () => {
         preparation: 'Vorbereitung:'
       }
     };
-    
+
     return texts[lang] || texts.en;
   };
 
-  // Debug function to check localStorage
-  const debugLocalStorage = () => {
-    const sessionId = localStorage.getItem('vibeCalendar_sessionId');
-    const connectedAt = localStorage.getItem('vibeCalendar_connectedAt');
-    console.log('🔍 [DEBUG] localStorage contents:', {
-      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-      connectedAt: connectedAt || 'none'
-    });
-  };
+
 
   useEffect(() => {
     // Only fetch events if we have a validated session and haven't attempted yet
     if (sessionId && isGoogleConnected && sessionValidated && !hasAttemptedFetch) {
-      console.log('🔄 [DASHBOARD] Session validated, fetching events with session ID:', sessionId.substring(0, 8) + '...');
       setHasAttemptedFetch(true);
       // Add a small delay to ensure axios headers are properly set
       setTimeout(() => {
         fetchEvents();
       }, 200);
-    } else if (!sessionId) {
-      console.log('🔄 [DASHBOARD] No session ID, skipping event fetch');
-    } else if (sessionId && !sessionValidated) {
-      console.log('🔄 [DASHBOARD] Session ID exists but not validated, waiting...');
-    } else if (sessionId && !isGoogleConnected) {
-      console.log('🔄 [DASHBOARD] Session ID exists but not connected, waiting for validation...');
     }
   }, [sessionId, isGoogleConnected, sessionValidated, hasAttemptedFetch]); // Removed fetchEvents from dependencies to prevent infinite loop
 
-  // Debug: Log events when they change
+  // Check if event count has changed (indicating new events were added)
   useEffect(() => {
-    console.log('Events updated:', events);
-  }, [events]);
+    console.log('🔍 [DASHBOARD] Event count check:', {
+      currentCount: events.length,
+      lastCount: lastEventCount,
+      hasChanged: events.length !== lastEventCount,
+      events: events.map(e => ({ id: e.id, title: e.summary, start: e.start?.dateTime || e.start?.date }))
+    });
 
-  // Debug: Check localStorage on mount
-  useEffect(() => {
-    debugLocalStorage();
-  }, []);
-  
+    if (events.length !== lastEventCount) {
+      console.log('🔄 [DASHBOARD] Event count changed, triggering refresh:', {
+        previousCount: lastEventCount,
+        newCount: events.length,
+        difference: events.length - lastEventCount
+      });
+      setLastEventCount(events.length);
+
+      // Force a re-fetch of events to ensure we have the latest data
+      // Use a longer delay to ensure Google Calendar API has propagated changes
+      setTimeout(() => {
+        console.log('🔄 [DASHBOARD] Executing delayed event refresh');
+        fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
+      }, 2000); // Increased delay to 2 seconds
+    }
+  }, [events, lastEventCount, fetchEvents]);
+
+
+
   // Reset Pomodoro session when Google Calendar connection changes
   useEffect(() => {
     if (sessionId) {
       setPomodoroSessionInitialized(false);
-      console.log('🔄 [CLIENT] Reset Pomodoro session due to new Google Calendar connection');
     }
   }, [sessionId]);
 
@@ -198,7 +205,6 @@ const Dashboard = () => {
     if (!sessionId || !isGoogleConnected) return;
 
     const refreshInterval = setInterval(() => {
-      console.log('🔄 [DASHBOARD] Periodic event refresh');
       fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
     }, 5 * 60 * 1000); // Refresh every 5 minutes
 
@@ -228,54 +234,75 @@ const Dashboard = () => {
     }
   };
 
-  // Auto-scroll to bottom when new messages are added
+  // Auto-scroll to the first line of new message bubbles
   useEffect(() => {
-    if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    if (chatContainerRef.current && chatMessages.length > 0) {
+      // Find the last message element
+      const messageElements = chatContainerRef.current.querySelectorAll('[data-message-index]');
+      if (messageElements.length > 0) {
+        const lastMessageElement = messageElements[messageElements.length - 1];
+        // Scroll to the top of the last message (first line)
+        lastMessageElement.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start',
+          inline: 'nearest'
+        });
+      }
     }
   }, [chatMessages, isTyping]);
 
-  // Fetch user information when session is validated (optional)
+  // Fetch user information when session is validated (optional) - only once
   useEffect(() => {
-    if (sessionId && isGoogleConnected && sessionValidated && !user) {
-      console.log('🔄 [DASHBOARD] Session validated, fetching user information');
+    if (sessionId && isGoogleConnected && sessionValidated && !user && !hasAttemptedUserFetch) {
+      setHasAttemptedUserFetch(true);
       // Add a delay to ensure session is fully established
       setTimeout(() => {
         fetchUserInfo().catch(error => {
-          console.log('⚠️ [DASHBOARD] Failed to fetch user info (non-critical):', error.message);
+          // Silent fail for user info fetch
         });
       }, 1000); // Increased delay to ensure session is stable
     }
-  }, [sessionId, isGoogleConnected, sessionValidated, user, fetchUserInfo]);
+  }, [sessionId, isGoogleConnected, sessionValidated, user, fetchUserInfo, hasAttemptedUserFetch]);
 
   const getUpcomingEvents = () => {
     const today = new Date();
-    const threeDaysFromNow = new Date(today);
-    threeDaysFromNow.setDate(today.getDate() + 3);
-    
+    const thirtyDaysFromNow = new Date(today);
+    thirtyDaysFromNow.setDate(today.getDate() + 30);
+
     const upcoming = events
       .filter(event => {
         const eventDate = new Date(event.start.dateTime || event.start.date);
-        return eventDate >= today && eventDate <= threeDaysFromNow;
+        return eventDate >= today && eventDate <= thirtyDaysFromNow;
       })
       .sort((a, b) => new Date(a.start.dateTime || a.start.date) - new Date(b.start.dateTime || b.start.date));
-    
-    console.log('Upcoming events (next 3 days):', upcoming);
+
     return upcoming;
   };
 
   const getEventsByDay = () => {
     const events = getUpcomingEvents();
     const eventsByDay = {};
-    
-    // Initialize next 3 days
-    for (let i = 0; i < 3; i++) {
-      const date = new Date();
-      date.setDate(date.getDate() + i);
-      const dateKey = date.toDateString();
+
+    // Get unique dates from events (up to 30 days)
+    const uniqueDates = new Set();
+    events.forEach(event => {
+      const eventDate = new Date(event.start.dateTime || event.start.date);
+      const dateKey = eventDate.toDateString();
+      uniqueDates.add(dateKey);
+    });
+
+    // Sort dates chronologically and take the first 14 days (to fit on screen)
+    const sortedDates = Array.from(uniqueDates)
+      .map(dateKey => new Date(dateKey))
+      .sort((a, b) => a - b)
+      .map(date => date.toDateString())
+      .slice(0, 14);
+
+    // Initialize days with events
+    sortedDates.forEach(dateKey => {
       eventsByDay[dateKey] = [];
-    }
-    
+    });
+
     // Group events by day
     events.forEach(event => {
       const eventDate = new Date(event.start.dateTime || event.start.date);
@@ -284,7 +311,7 @@ const Dashboard = () => {
         eventsByDay[dateKey].push(event);
       }
     });
-    
+
     return eventsByDay;
   };
 
@@ -304,14 +331,6 @@ const Dashboard = () => {
 
   // Pomodoro timer functions
   const startPomodoro = () => {
-    console.log('🍅 [CLIENT] Starting Pomodoro:', {
-      workDuration,
-      breakDuration,
-      pomodoroState,
-      isRunning,
-      timeLeft
-    });
-    
     setPomodoroState('work');
     setTimeLeft(workDuration * 60); // Use AI-determined work duration
     setIsRunning(true);
@@ -319,7 +338,7 @@ const Dashboard = () => {
     setPomodoroSuggestion(null);
     setShowPomodoroNotification(false); // Close notification if open
     setPomodoroNotificationData(null);
-    
+
     console.log('✅ [CLIENT] Pomodoro started successfully');
   };
 
@@ -349,7 +368,7 @@ const Dashboard = () => {
   const checkUpcomingEvents = async () => {
     const now = new Date();
     const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
-    
+
     const upcomingSoon = events.filter(event => {
       const eventTime = new Date(event.start.dateTime || event.start.date);
       return eventTime >= now && eventTime <= fiveMinutesFromNow;
@@ -379,28 +398,28 @@ const Dashboard = () => {
           timeUntil: Math.round((new Date(event.start.dateTime || event.start.date) - now) / (1000 * 60))
         }))
       });
-      
+
       // Mark these events as notified
       const newEventIds = newEvents.map(event => event.id || `${event.summary}_${event.start.dateTime || event.start.date}`);
       setNotifiedEvents(prev => new Set([...prev, ...newEventIds]));
-      
+
       // Get AI suggestion for Pomodoro sessions
       try {
         const suggestion = await getPomodoroSuggestion(newEvents);
-        
+
         console.log('✅ [CLIENT] Pomodoro suggestion applied:', {
           suggestion: suggestion,
           workDuration: suggestion.workDuration,
           breakDuration: suggestion.breakDuration
         });
-        
+
         // Set AI-determined durations
         if (suggestion.workDuration && suggestion.breakDuration) {
           setWorkDuration(suggestion.workDuration);
           setBreakDuration(suggestion.breakDuration);
           setTimeLeft(suggestion.workDuration * 60); // Update timer display
         }
-        
+
         // Show elegant browser notification
         showElegantNotification(suggestion);
       } catch (error) {
@@ -428,13 +447,13 @@ const Dashboard = () => {
   // Get AI suggestion for Pomodoro sessions
   const getPomodoroSuggestion = async (upcomingEvents) => {
     const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-    
+
     console.log('🍅 [CLIENT] Getting Pomodoro suggestion:', {
       requestId,
       upcomingEventsCount: upcomingEvents?.length || 0,
       timestamp: new Date().toISOString()
     });
-    
+
     // Debug: Log the actual event timing information
     console.log('⏰ [CLIENT] Event timing details:', {
       requestId,
@@ -452,7 +471,7 @@ const Dashboard = () => {
       const title = event.summary?.toLowerCase() || '';
       const description = event.description?.toLowerCase() || '';
       const location = event.location?.toLowerCase() || '';
-      
+
       if (title.includes('meeting') || title.includes('call') || title.includes('zoom') || title.includes('teams') || title.includes('google meet')) {
         return 'meeting';
       } else if (title.includes('presentation') || title.includes('demo') || title.includes('pitch')) {
@@ -484,7 +503,7 @@ const Dashboard = () => {
       const durationMs = endTime - startTime;
       const durationMinutes = Math.round(durationMs / (1000 * 60));
       const timeUntilEvent = Math.round((startTime - new Date()) / (1000 * 60));
-      
+
       // Validate timing calculations
       if (timeUntilEvent < 0) {
         console.warn('⚠️ [CLIENT] Event has already started:', {
@@ -493,7 +512,7 @@ const Dashboard = () => {
           timeUntilEvent: timeUntilEvent
         });
       }
-      
+
       return {
         title: event.summary,
         description: event.description || 'No description provided',
@@ -511,7 +530,7 @@ const Dashboard = () => {
     });
 
     const userLang = detectUserLanguage();
-    
+
     try {
       console.log('🤖 [CLIENT] Sending Pomodoro suggestion request:', {
         requestId,
@@ -525,7 +544,7 @@ const Dashboard = () => {
           initializeSession: !pomodoroSessionInitialized
         }
       });
-      
+
       const response = await fetch('/api/ai/pomodoro-suggestion', {
         method: 'POST',
         headers: {
@@ -556,9 +575,9 @@ const Dashboard = () => {
         });
         throw new Error(`Failed to get suggestion: ${response.status} ${response.statusText}`);
       }
-      
+
       const data = await response.json();
-      
+
       console.log('✅ [CLIENT] Pomodoro suggestion data received:', {
         requestId,
         data: data,
@@ -566,19 +585,19 @@ const Dashboard = () => {
         workDuration: data.workDuration,
         breakDuration: data.breakDuration
       });
-      
-        // Mark session as initialized after first successful request
-  if (!pomodoroSessionInitialized) {
-    setPomodoroSessionInitialized(true);
-    console.log('🔄 [CLIENT] Pomodoro session initialized');
-  }
-  
-  // Reset session if we get an error indicating session needs reinitialization
-  if (data.error === 'System prompt not initialized') {
-    setPomodoroSessionInitialized(false);
-    console.log('🔄 [CLIENT] Resetting Pomodoro session due to initialization error');
-  }
-      
+
+      // Mark session as initialized after first successful request
+      if (!pomodoroSessionInitialized) {
+        setPomodoroSessionInitialized(true);
+        console.log('🔄 [CLIENT] Pomodoro session initialized');
+      }
+
+      // Reset session if we get an error indicating session needs reinitialization
+      if (data.error === 'System prompt not initialized') {
+        setPomodoroSessionInitialized(false);
+        console.log('🔄 [CLIENT] Resetting Pomodoro session due to initialization error');
+      }
+
       return data;
     } catch (error) {
       console.error('❌ [CLIENT] Pomodoro suggestion error:', {
@@ -608,7 +627,7 @@ const Dashboard = () => {
       timeLeft,
       hasInterval: !!pomodoroIntervalRef.current
     });
-    
+
     if (isRunning) {
       console.log('🔄 [CLIENT] Starting Pomodoro timer interval');
       pomodoroIntervalRef.current = setInterval(() => {
@@ -619,7 +638,7 @@ const Dashboard = () => {
             workDuration,
             breakDuration
           });
-          
+
           if (prev <= 1) {
             // Timer finished
             if (pomodoroState === 'work') {
@@ -685,6 +704,105 @@ const Dashboard = () => {
     return () => clearInterval(checkInterval);
   }, [events, pomodoroState, showPomodoroSuggestion]);
 
+  // Handle SSE streaming request
+  const handleSSERequest = (inputValue) => {
+    return new Promise((resolve, reject) => {
+      console.log('🚀 [DASHBOARD] Starting SSE request for:', inputValue);
+
+      // Create EventSource for SSE
+      const eventSource = new EventSource(`http://localhost:50001/api/ai/schedule-stream?${new URLSearchParams({
+        description: inputValue,
+        sessionId: sessionId,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+      })}`);
+
+      eventSource.onopen = () => {
+        console.log('✅ [DASHBOARD] SSE connection opened');
+      };
+
+      eventSource.onmessage = (event) => {
+        console.log('📨 [DASHBOARD] SSE message received:', event.data);
+
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'intermittent') {
+            console.log('⚡ [DASHBOARD] Showing intermittent message:', data.message);
+            console.log('🔧 [DASHBOARD] Tools running:', data.tools);
+            // Add intermittent message immediately
+            const messageId = Date.now();
+            setChatMessages(prev => [...prev, {
+              id: messageId,
+              type: 'ai',
+              content: data.message,
+              isProcessing: true,
+              tools: data.tools || []
+            }]);
+
+          } else if (data.type === 'final') {
+            console.log('✅ [DASHBOARD] Showing final message:', data.message);
+            // Clear processing state from intermittent messages and add final message
+            setChatMessages(prev => {
+              const updated = prev.map(msg =>
+                msg.isProcessing
+                  ? { ...msg, isProcessing: false }
+                  : msg
+              );
+              return [...updated, {
+                id: Date.now() + Math.random(),
+                type: 'ai',
+                content: data.message,
+                isProcessing: false,
+                tools: [] // No tools for final message
+              }];
+            });
+            eventSource.close();
+            setIsTyping(false);
+            resolve();
+
+          } else if (data.type === 'error') {
+            console.error('❌ [DASHBOARD] SSE error:', data.message);
+            setChatMessages(prev => [...prev, {
+              id: Date.now(),
+              type: 'ai',
+              content: data.message,
+              isProcessing: false
+            }]);
+            eventSource.close();
+            setIsTyping(false);
+            reject(new Error(data.message));
+          }
+        } catch (parseError) {
+          console.error('❌ [DASHBOARD] Error parsing SSE data:', parseError);
+          setIsTyping(false);
+          reject(parseError);
+        }
+      };
+
+      eventSource.onerror = (error) => {
+        console.error('❌ [DASHBOARD] SSE error:', error);
+        eventSource.close();
+        setIsTyping(false);
+        setChatMessages(prev => [...prev, {
+          id: Date.now(),
+          type: 'ai',
+          content: '连接出现问题，请稍后再试。',
+          isProcessing: false
+        }]);
+        reject(error);
+      };
+
+      // Fallback: close connection after 60 seconds
+      setTimeout(() => {
+        if (eventSource.readyState !== EventSource.CLOSED) {
+          eventSource.close();
+          setIsTyping(false);
+          reject(new Error('Request timeout'));
+        }
+      }, 60000);
+    });
+  };
+
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!inputMessage.trim() || isTyping) return;
@@ -700,57 +818,32 @@ const Dashboard = () => {
     setIsTyping(true);
 
     try {
-      // Get AI suggestion - let the AI determine intent from the message itself
-      const result = await getAISuggestions(inputMessage, '');
-      
-      let aiMessage;
-      
-      // Handle the new multiple actions response format
-      if (result.success && result.actions && result.actions.length === 0) {
-        // AI is just chatting - show the message
-        aiMessage = {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: result.aiMessage
-        };
-        setChatMessages(prev => [...prev, aiMessage]);
-      } else if (result.success && result.actions && result.actions.length > 0) {
-        // Multiple actions were performed
-        const hasConfirmationRequired = result.actionResults?.some(r => r.requiresConfirmation);
-        
-        if (hasConfirmationRequired) {
-          // Some actions require confirmation
-          aiMessage = {
-            id: Date.now() + 1,
-            type: 'ai',
-            content: result.aiMessage,
-            requiresConfirmation: true,
-            actions: result.actions,
-            actionResults: result.actionResults
-          };
-        } else {
-          // All actions completed successfully
-          aiMessage = {
-            id: Date.now() + 1,
-            type: 'ai',
-            content: result.aiMessage
-          };
-        }
-        setChatMessages(prev => [...prev, aiMessage]);
-      } else {
-        // Action failed or error occurred
-        aiMessage = {
-          id: Date.now() + 1,
-          type: 'ai',
-          content: result.aiMessage || "I'm having trouble with that request. Could you try rephrasing it?"
-        };
-        setChatMessages(prev => [...prev, aiMessage]);
-      }
+      // Use SSE for streaming AI responses
+      await handleSSERequest(inputMessage);
+      // SSE handles all messages, no additional processing needed
     } catch (error) {
+      console.error('❌ [DASHBOARD] AI request failed:', {
+        error: error.message,
+        status: error.response?.status,
+        data: error.response?.data
+      });
+
+      let errorContent = "I'm having trouble processing your request right now. ";
+
+      if (error.response?.status === 429) {
+        errorContent += "The AI service is busy. Please wait a moment and try again.";
+      } else if (error.response?.status === 503) {
+        errorContent += "The AI service is temporarily unavailable. Please try again later.";
+      } else if (error.message && (error.message.includes('fetch failed') || error.message.includes('network'))) {
+        errorContent += "There's a network connection issue. Please check your internet connection.";
+      } else {
+        errorContent += "Could you try rephrasing your request? For example: 'Schedule a meeting tomorrow' or 'Show my events for this week'.";
+      }
+
       const errorMessage = {
         id: Date.now() + 1,
         type: 'ai',
-        content: "Oops! I'm having a little trouble understanding that right now. Could you try rephrasing it? For example, you could say 'Schedule a meeting tomorrow' or 'Remind me to call mom on Friday'. I'm here to help! 😊"
+        content: errorContent
       };
       setChatMessages(prev => [...prev, errorMessage]);
     } finally {
@@ -760,17 +853,17 @@ const Dashboard = () => {
 
   const handleOverlapChoice = async (choice, overlapEvents, overlaps) => {
     const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-    
+
     console.log('🔄 [DASHBOARD] Handling overlap choice:', {
       requestId,
       choice,
       overlapEventsCount: overlapEvents?.length || 0,
       overlapsCount: overlaps?.length || 0
     });
-    
+
     try {
       let aiMessage;
-      
+
       switch (choice) {
         case 'reschedule':
           // Ask AI to reschedule to different times
@@ -780,29 +873,18 @@ const Dashboard = () => {
             content: "I'll help you find a better time that doesn't conflict with your existing events. Let me look for alternative slots... 🔄"
           };
           setChatMessages(prev => [...prev, aiMessage]);
-          
-          // Create a new request to reschedule
-          const rescheduleDescription = `Please reschedule these events to avoid conflicts: ${overlapEvents.map(event => event.title).join(', ')}`;
-          const result = await getAISuggestions(rescheduleDescription, 'Reschedule to avoid conflicts');
-          
-          if (result.success && result.actions && result.actions.length > 0) {
-            // Actions were performed successfully
+
+          // For now, show a simple message about rescheduling
+          setTimeout(() => {
             const newAiMessage = {
               id: Date.now() + 2,
               type: 'ai',
-              content: result.aiMessage
+              content: "I've noted your preference to reschedule conflicting events. You can manually reschedule them in your calendar, or try asking me to 'Schedule [event] at a different time' for specific events."
             };
             setChatMessages(prev => [...prev, newAiMessage]);
-          } else {
-            const errorMessage = {
-              id: Date.now() + 2,
-              type: 'ai',
-              content: result.aiMessage || "I'm having trouble finding a conflict-free time. Could you try specifying a different date or time preference?"
-            };
-            setChatMessages(prev => [...prev, errorMessage]);
-          }
+          }, 1000);
           break;
-          
+
         case 'cancel_conflicting':
           // Cancel conflicting events and create new ones
           aiMessage = {
@@ -811,11 +893,11 @@ const Dashboard = () => {
             content: "I'll cancel the conflicting events and create your new events. This will remove the overlapping events from your calendar. ⚠️"
           };
           setChatMessages(prev => [...prev, aiMessage]);
-          
+
           // TODO: Implement event deletion functionality
           // For now, just create the new events
           await createEventFromSuggestion(overlapEvents);
-          
+
           const successMessage = {
             id: Date.now() + 2,
             type: 'ai',
@@ -823,7 +905,7 @@ const Dashboard = () => {
           };
           setChatMessages(prev => [...prev, successMessage]);
           break;
-          
+
         case 'create_anyway':
           // Create overlapping events anyway
           aiMessage = {
@@ -832,9 +914,9 @@ const Dashboard = () => {
             content: "Creating your events with the overlapping times. You'll have multiple events at the same time in your calendar. ⚠️"
           };
           setChatMessages(prev => [...prev, aiMessage]);
-          
+
           await createEventFromSuggestion(overlapEvents);
-          
+
           const createdMessage = {
             id: Date.now() + 2,
             type: 'ai',
@@ -849,7 +931,7 @@ const Dashboard = () => {
         choice,
         error: error.message
       });
-      
+
       const errorMessage = {
         id: Date.now() + 1,
         type: 'ai',
@@ -859,51 +941,75 @@ const Dashboard = () => {
     }
   };
 
-  const handleConfirmActions = async (actions, actionResults) => {
+  const handleConfirmActions = async (tools, toolResults) => {
     try {
-      await confirmAIAction(actions, actionResults);
-      
-      const confirmationMessage = {
-        id: Date.now() + 1,
-        type: 'ai',
-        content: "✅ All actions have been confirmed and executed successfully!"
-      };
-      setChatMessages(prev => [...prev, confirmationMessage]);
+      await confirmAIAction(tools, toolResults);
+
+      // Update the existing message to show completion and revert to normal style
+      setChatMessages(prev => prev.map(msg =>
+        msg.requiresConfirmation
+          ? {
+            ...msg,
+            content: "All tools have been confirmed and executed successfully!",
+            isProcessing: false,
+            isCompleted: false,
+            requiresConfirmation: false,
+            tools: undefined,
+            toolResults: undefined
+          }
+          : msg
+      ));
     } catch (error) {
-      console.error('❌ [DASHBOARD] Error confirming actions:', error);
-      
-      const errorMessage = {
-        id: Date.now() + 1,
-        type: 'ai',
-        content: "❌ Failed to confirm actions. Please try again or contact support if the issue persists."
-      };
-      setChatMessages(prev => [...prev, errorMessage]);
+      console.error('❌ [DASHBOARD] Error confirming tools:', error);
+
+      // Update the existing message to show error and revert to normal style
+      setChatMessages(prev => prev.map(msg =>
+        msg.requiresConfirmation
+          ? {
+            ...msg,
+            content: "❌ Failed to confirm tools. Please try again or contact support if the issue persists.",
+            isProcessing: false,
+            isCompleted: false,
+            requiresConfirmation: false,
+            tools: undefined,
+            toolResults: undefined
+          }
+          : msg
+      ));
     }
   };
 
   const handleCancelActions = () => {
-    const cancelMessage = {
-      id: Date.now() + 1,
-      type: 'ai',
-      content: "❌ Actions have been cancelled. No changes were made to your calendar."
-    };
-    setChatMessages(prev => [...prev, cancelMessage]);
+    // Update the existing message to show cancellation and revert to normal style
+    setChatMessages(prev => prev.map(msg =>
+      msg.requiresConfirmation
+        ? {
+          ...msg,
+          content: "❌ Tools have been cancelled. No changes were made to your calendar.",
+          isProcessing: false,
+          isCompleted: false,
+          requiresConfirmation: false,
+          tools: undefined,
+          toolResults: undefined
+        }
+        : msg
+    ));
   };
 
   const createEventFromSuggestion = async (suggestion) => {
     const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-    
+
     console.log('🎯 [DASHBOARD] Starting event creation from suggestion:', {
       requestId,
       suggestionType: Array.isArray(suggestion) ? 'array' : 'single',
       suggestionCount: Array.isArray(suggestion) ? suggestion.length : 1,
       originalSuggestion: suggestion
     });
-    
+
     try {
       const events = Array.isArray(suggestion) ? suggestion : [suggestion];
       const eventCount = events.length;
-      
+
       console.log('📋 [DASHBOARD] Processing events for creation:', {
         requestId,
         eventCount,
@@ -918,11 +1024,11 @@ const Dashboard = () => {
           reminders: event.reminders
         }))
       });
-      
+
       let createdCount = 0;
       const createdEvents = [];
       const failedEvents = [];
-      
+
       for (const [index, event] of events.entries()) {
         console.log(`🔄 [DASHBOARD] Processing event ${index + 1}/${eventCount}:`, {
           requestId,
@@ -931,7 +1037,7 @@ const Dashboard = () => {
           startTime: event.startTime,
           endTime: event.endTime
         });
-        
+
         try {
           // AI already provided startTime and endTime, so we can use them directly
           const eventData = {
@@ -956,10 +1062,10 @@ const Dashboard = () => {
             duration: Math.round((new Date(eventData.endTime) - new Date(eventData.startTime)) / (1000 * 60)) + ' minutes'
           });
 
-          const createdEvent = await createEvent(eventData);
+          const createdEvent = await createEvent(eventData, { skipRefresh: true, skipToast: true });
           createdCount++;
           createdEvents.push(event.title);
-          
+
           console.log(`✅ [DASHBOARD] Event ${index + 1} created successfully:`, {
             requestId,
             eventIndex: index + 1,
@@ -985,7 +1091,7 @@ const Dashboard = () => {
           });
         }
       }
-      
+
       console.log('📊 [DASHBOARD] Event creation summary:', {
         requestId,
         totalEvents: eventCount,
@@ -994,7 +1100,7 @@ const Dashboard = () => {
         createdEvents,
         failedEvents
       });
-      
+
       let confirmationMessage;
       if (failedEvents.length === 0) {
         // All events created successfully
@@ -1017,7 +1123,7 @@ const Dashboard = () => {
         // Some events created, some failed
         const successList = createdEvents.map((title, index) => `✅ ${index + 1}. ${title}`).join('\n');
         const failedList = failedEvents.map((item, index) => `❌ ${index + 1}. ${item.title} (${item.error})`).join('\n');
-        
+
         confirmationMessage = {
           id: Date.now(),
           type: 'ai',
@@ -1026,15 +1132,20 @@ const Dashboard = () => {
       } else {
         // All events failed
         const failedList = failedEvents.map((item, index) => `❌ ${index + 1}. ${item.title} (${item.error})`).join('\n');
-        
+
         confirmationMessage = {
           id: Date.now(),
           type: 'ai',
           content: `❌ I couldn't create any of your events. Here's what went wrong:\n\n${failedList}\n\nPlease try again or let me know if you'd like to adjust anything! 😊`
         };
       }
-      
+
       setChatMessages(prev => [...prev, confirmationMessage]);
+
+      // Refresh events once after all events are processed
+      if (createdCount > 0) {
+        setTimeout(() => fetchEvents(), 1000);
+      }
     } catch (error) {
       console.error('❌ [DASHBOARD] Unexpected error in event creation:', {
         requestId,
@@ -1046,7 +1157,7 @@ const Dashboard = () => {
         errorStatus: error.response?.status,
         errorStatusText: error.response?.statusText
       });
-      
+
       const errorMessage = {
         id: Date.now(),
         type: 'ai',
@@ -1059,15 +1170,26 @@ const Dashboard = () => {
   const upcomingEvents = getUpcomingEvents();
 
   return (
-    <div className="space-y-2 max-w-4xl mx-auto">
+    <div className="h-screen flex flex-col overflow-hidden p-2">
       {/* Header */}
-      <div className="flex items-center justify-between mb-1">
-        <h1 className="text-base font-medium text-gray-700">Vibe Calendar by Dorian</h1>
+      <div className="flex items-center justify-between p-1 flex-shrink-0">
+        <h1 className="text-sm font-normal text-gray-800">Vibe Calendar made by Dorian and his intern Cursor</h1>
         <div className="flex items-center space-x-2">
+          {!isChatVisible && (
+            <button
+              onClick={() => setIsChatVisible(true)}
+              className="p-2 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors"
+              title="Show Chat"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+            </button>
+          )}
           {sessionId && (
             <button
               onClick={disconnectGoogleCalendar}
-              className="px-2 py-1 text-xs text-gray-500 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
+              className="px-2 py-1 text-xs text-gray-600 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
               title="Disconnect Google Calendar"
             >
               Disconnect
@@ -1076,55 +1198,161 @@ const Dashboard = () => {
         </div>
       </div>
 
-      <div className="space-y-2">
+      <div className={`flex gap-3 flex-1 min-h-0 ${isChatVisible ? 'flex-row' : 'flex-col'}`}>
         {/* Upcoming Events Section */}
-        <div className="card">
-          <div className="flex items-center justify-between mb-1">
-            <h2 className="text-sm font-semibold text-gray-900 flex items-center space-x-2">
-              <Calendar className="h-3 w-3" />
-              <span>{user?.name ? `${user.name}'s Upcoming Events` : 'Upcoming Events'}</span>
-            </h2>
-            {loading && (
-              <div className="text-xs text-gray-500">Loading...</div>
-            )}
+        <div className={`card flex flex-col bg-white rounded-xl shadow-sm min-h-0 ${isChatVisible ? 'flex-[2]' : 'w-full'}`}>
+          <div className="flex items-center justify-between p-1 flex-shrink-0">
+            <div className="flex items-center space-x-2">
+              <Calendar className="h-4 w-4 text-gray-600" />
+              <div>
+                <h2 className="text-sm font-normal text-gray-800">
+                  {user?.name ? `${user.name}'s Schedule` : 'Upcoming Events'}
+                </h2>
+                <p className="text-xs text-gray-500">Upcoming events</p>
+              </div>
+            </div>
           </div>
-          
+
           {(() => {
             const eventsByDay = getEventsByDay();
             const hasEvents = Object.values(eventsByDay).some(dayEvents => dayEvents.length > 0);
-            
+
             if (hasEvents) {
               return (
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7 gap-1 p-1 flex-1 overflow-y-auto min-h-0">
                   {Object.entries(eventsByDay).map(([dateKey, dayEvents]) => {
                     const date = new Date(dateKey);
                     const isTodayDate = isToday(date);
                     const isTomorrowDate = isTomorrow(date);
-                    
+
                     return (
-                      <div key={dateKey} className="space-y-1">
-                        <div className="text-center">
-                          <div className={`text-xs font-medium ${isTodayDate ? 'text-primary-600' : 'text-gray-700'}`}>
+                      <div key={dateKey} className="space-y-0.5">
+                        <div className="text-center pb-1">
+                          <div className={`text-sm font-normal ${isTodayDate ? 'text-blue-600' : 'text-gray-700'}`}>
                             {isTodayDate ? 'Today' : isTomorrowDate ? 'Tomorrow' : format(date, 'EEE')}
                           </div>
-                          <div className="text-xs text-gray-500">
+                          <div className="text-xs text-gray-500 mt-0.5">
                             {format(date, 'MMM d')}
                           </div>
                         </div>
-                        
+
                         <div className="space-y-0.5">
                           {dayEvents.length > 0 ? (
                             dayEvents.map((event) => (
-                              <div key={event.id} className="p-1 bg-gray-50 rounded text-xs">
-                                <div className="font-medium text-gray-900 truncate">
-                                  {event.summary}
+                              <div
+                                key={event.id}
+                                className="group relative bg-white border border-gray-100 rounded-2xl p-2 hover:bg-gray-50 hover:border-gray-200 transition-all duration-200 cursor-pointer"
+                                title={event.description || event.location || event.attendees || event.reminders ? 'Hover for details' : ''}
+                              >
+                                <div className="flex items-start justify-between">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="font-normal text-gray-800 text-xs leading-tight truncate mb-1">
+                                      {event.summary}
+                                    </div>
+                                    <div className="text-xs text-gray-500 flex items-center space-x-1">
+                                      <span className="flex items-center">
+                                        <svg className="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                        {getEventTime(event)}
+                                      </span>
+                                      {event.location && (
+                                        <span className="flex items-center">
+                                          <svg className="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                                          </svg>
+                                          <span className="truncate">{event.location}</span>
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <div className="flex flex-col items-end space-y-1 ml-2">
+                                    {event.recurringEventId && (
+                                      <div className="w-2 h-2 bg-blue-500 rounded-full" title="Recurring event"></div>
+                                    )}
+                                    {event.transparency === 'transparent' && (
+                                      <div className="w-2 h-2 bg-gray-400 rounded-full" title="Busy"></div>
+                                    )}
+                                    {event.transparency === 'opaque' && (
+                                      <div className="w-2 h-2 bg-green-500 rounded-full" title="Available"></div>
+                                    )}
+                                  </div>
                                 </div>
-                                <div className="text-gray-500">
-                                  {getEventTime(event)}
-                                </div>
-                                {event.location && (
-                                  <div className="text-gray-400 truncate">
-                                    📍 {event.location}
+
+                                {/* Minimal elegant hover tooltip */}
+                                {(event.description || event.location || event.attendees || event.reminders) && (
+                                  <div
+                                    className="fixed px-4 py-2 bg-white border border-gray-100 text-gray-800 text-sm rounded-lg shadow-lg opacity-0 group-hover:opacity-100 transition-all duration-200 pointer-events-none z-50"
+                                    style={{
+                                      width: '250px',
+                                      maxWidth: 'calc(100vw - 2rem)'
+                                    }}
+                                    onMouseEnter={(e) => {
+                                      const eventRect = e.currentTarget.parentElement.getBoundingClientRect();
+                                      const tooltip = e.currentTarget;
+                                      const tooltipWidth = 250;
+                                      const viewportWidth = window.innerWidth;
+
+                                      // Calculate position
+                                      let left = eventRect.left + (eventRect.width / 2) - (tooltipWidth / 2);
+
+                                      // Adjust if too close to edges
+                                      if (left < 10) {
+                                        left = 10;
+                                      } else if (left + tooltipWidth > viewportWidth - 10) {
+                                        left = viewportWidth - tooltipWidth - 10;
+                                      }
+
+                                      tooltip.style.left = left + 'px';
+                                      tooltip.style.top = (eventRect.top - tooltip.offsetHeight - 8) + 'px';
+                                    }}
+                                  >
+                                    {/* Event Title */}
+                                    <div className="font-normal text-gray-900 mb-1">{event.summary}</div>
+
+                                    {/* Time */}
+                                    <div className="text-gray-600 mb-1">
+                                      {getEventTime(event)}
+                                    </div>
+
+                                    {/* Description - only if short */}
+                                    {event.description && event.description.length < 200 && (
+                                      <div className="text-gray-600 mb-1 leading-relaxed">
+                                        {event.description}
+                                      </div>
+                                    )}
+
+                                    {/* Location */}
+                                    {event.location && (
+                                      <div className="text-gray-600 mb-1">
+                                        {event.location}
+                                      </div>
+                                    )}
+
+                                    {/* Attendees - simplified */}
+                                    {event.attendees && event.attendees.length > 0 && (
+                                      <div className="text-gray-600 mb-1">
+                                        {event.attendees.length} attendee{event.attendees.length !== 1 ? 's' : ''}
+                                      </div>
+                                    )}
+
+                                    {/* Reminders - simplified */}
+                                    {event.reminders && event.reminders.overrides && event.reminders.overrides.length > 0 && (
+                                      <div className="text-gray-600">
+                                        {event.reminders.overrides[0].minutes} min reminder
+                                      </div>
+                                    )}
+
+                                    {/* Arrow */}
+                                    <div
+                                      className="absolute w-0 h-0 border-l-3 border-r-3 border-t-3 border-transparent border-t-white"
+                                      style={{
+                                        bottom: '-3px',
+                                        left: '50%',
+                                        transform: 'translateX(-50%)'
+                                      }}
+                                    ></div>
                                   </div>
                                 )}
                               </div>
@@ -1142,11 +1370,13 @@ const Dashboard = () => {
               );
             } else {
               return (
-                <div className="text-center py-3">
-                  <Calendar className="h-5 w-5 text-gray-400 mx-auto mb-1" />
-                  <p className="text-gray-500 text-xs">No upcoming events</p>
-                  <p className="text-xs text-gray-400 mt-1">
-                    {sessionId ? "Try asking me to schedule something!" : "Connect your Google Calendar to see events"}
+                <div className="flex flex-col items-center justify-center h-full p-2">
+                  <div className="w-8 h-8 bg-gradient-to-r from-blue-50 to-purple-50 rounded-full flex items-center justify-center mb-2">
+                    <Calendar className="h-4 w-4 text-gray-400" />
+                  </div>
+                  <h3 className="text-xs font-normal text-gray-700 mb-0.5">Clear Schedule</h3>
+                  <p className="text-xs text-gray-500 text-center max-w-xs">
+                    {sessionId ? "No upcoming events found. Enjoy your free time!" : "Connect your Google Calendar to see events"}
                   </p>
                 </div>
               );
@@ -1157,191 +1387,395 @@ const Dashboard = () => {
         {/* Pomodoro timer only shows in notification overlay - no main page timer */}
 
         {/* AI Chat Section */}
-        <div className="card">
-          <div className="flex items-center space-x-2 mb-1">
-            <MessageCircle className="h-3 w-3 text-primary-600" />
-            <h2 className="text-sm font-semibold text-gray-900">AI Assistant</h2>
-          </div>
-          
-          {/* Chat Messages */}
-          <div ref={chatContainerRef} className="h-28 overflow-y-auto mb-1 space-y-1">
-            {chatMessages.length === 0 ? (
-              <div className="flex justify-center items-center h-full">
-                <div className="text-center text-gray-500">
-                  <MessageCircle className="h-5 w-5 mx-auto mb-1 text-gray-400" />
-                  <p className="text-xs">Hi there! 👋 I'm your friendly calendar assistant</p>
-                  <p className="text-xs text-gray-400 mt-1">Just tell me what you'd like to schedule!</p>
-                </div>
-              </div>
-            ) : (
-              chatMessages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
+        {isChatVisible && (
+          <div className="card flex-[1] flex flex-col bg-white rounded-xl shadow-sm min-h-0">
+            <div className="flex items-center justify-between p-1 flex-shrink-0">
+              <div className="flex-1"></div>
+              <div className="flex-1 flex justify-end">
+                <button
+                  onClick={() => setIsChatVisible(false)}
+                  className="p-1 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors"
+                  title="Hide Chat"
                 >
-                  <div
-                    className={`chat-message ${
-                      message.type === 'user' ? 'user' : 'ai'
-                    }`}
-                  >
-                    <div className="whitespace-pre-wrap">{message.content}</div>
-                    
-                    {/* Overlap handling buttons */}
-                    {message.hasOverlaps && message.overlapEvents && (
-                      <div className="mt-3 space-y-2">
-                        <div className="text-xs text-gray-500 mb-2">How would you like to handle this conflict?</div>
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            onClick={() => handleOverlapChoice('reschedule', message.overlapEvents, message.overlaps)}
-                            className="px-3 py-1 bg-blue-100 text-blue-700 rounded text-xs hover:bg-blue-200 transition-colors"
-                          >
-                            🔄 Reschedule
-                          </button>
-                          <button
-                            onClick={() => handleOverlapChoice('cancel_conflicting', message.overlapEvents, message.overlaps)}
-                            className="px-3 py-1 bg-red-100 text-red-700 rounded text-xs hover:bg-red-200 transition-colors"
-                          >
-                            ❌ Cancel Conflicting
-                          </button>
-                          <button
-                            onClick={() => handleOverlapChoice('create_anyway', message.overlapEvents, message.overlaps)}
-                            className="px-3 py-1 bg-green-100 text-green-700 rounded text-xs hover:bg-green-200 transition-colors"
-                          >
-                            ✅ Create Anyway
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                    
-                    {/* Action confirmation buttons */}
-                    {message.requiresConfirmation && message.actions && message.actionResults && (
-                      <div className="mt-3 space-y-2">
-                        <div className="text-xs text-gray-500 mb-2">Please confirm these actions:</div>
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            onClick={() => handleConfirmActions(message.actions, message.actionResults)}
-                            className="px-3 py-1 bg-green-100 text-green-700 rounded text-xs hover:bg-green-200 transition-colors"
-                          >
-                            ✅ Confirm All
-                          </button>
-                          <button
-                            onClick={() => handleCancelActions()}
-                            className="px-3 py-1 bg-red-100 text-red-700 rounded text-xs hover:bg-red-200 transition-colors"
-                          >
-                            ❌ Cancel All
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))
-            )}
-            {isTyping && (
-              <div className="flex justify-start">
-                <div className="bg-gray-100 text-gray-900 px-2 py-1 rounded-lg">
-                  <div className="flex space-x-1">
-                    <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce"></div>
-                    <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
-                    <div className="w-1 h-1 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
-                  </div>
-                </div>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
               </div>
-            )}
-          </div>
+            </div>
 
-          {/* Chat Input */}
-          <form onSubmit={handleSendMessage} className="flex space-x-2">
-            <input
-              type="text"
-              value={inputMessage}
-              onChange={(e) => setInputMessage(e.target.value)}
-              placeholder="What would you like to schedule? 😊"
-              className="flex-1 px-2 py-1 text-xs border border-gray-300 rounded-lg focus:ring-1 focus:ring-primary-500 focus:border-transparent"
-              disabled={isTyping}
-            />
-            <button
-              type="submit"
-              disabled={!inputMessage.trim() || isTyping}
-              className="px-2 py-1 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              <Send className="h-3 w-3" />
-            </button>
-            <button
-              type="button"
-              onClick={() => fetchEvents()}
-              disabled={loading}
-              className="px-2 py-1 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50 transition-colors"
-              title="Refresh Events"
-            >
-              🔄
-            </button>
-            {pomodoroState === 'idle' && (
-              <button
-                type="button"
-                onClick={startPomodoro}
-                className="px-2 py-1 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors"
-                title="Start Pomodoro Timer"
-              >
-                🍅
-              </button>
-            )}
-          </form>
-        </div>
+            {/* Chat Messages */}
+            <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-1 space-y-1 min-h-0">
+              {chatMessages.length === 0 ? (
+                <div className="flex justify-center items-center h-full">
+                  <div className="text-center">
+                    <div className="w-12 h-12 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <MessageCircle className="h-6 w-6 text-gray-600" />
+                    </div>
+                    <p className="text-sm font-normal text-gray-800 mb-2">Hi there! 👋</p>
+                    <p className="text-sm text-gray-600 leading-relaxed">I'm your friendly personal assistant.<br />Just tell me what you'd like to schedule!</p>
+                  </div>
+                </div>
+              ) : (
+                chatMessages.map((message, index) => (
+                  <div
+                    key={message.id}
+                    data-message-index={index}
+                    className={`flex flex-col ${message.type === 'user' ? 'items-end' : 'items-start'} mb-4`}
+                  >
+                    <div
+                      className={`max-w-[80%] ${message.type === 'user'
+                        ? 'bg-gray-200 text-gray-800 rounded-2xl px-4 py-3 ml-auto'
+                        : message.isCompleted
+                          ? 'bg-green-50 border border-green-200 rounded-2xl px-4 py-3'
+                          : message.requiresConfirmation
+                            ? 'bg-yellow-50 border border-yellow-200 rounded-2xl px-4 py-3'
+                            : 'bg-white border border-gray-100 rounded-2xl px-4 py-3'
+                        }`}
+                    >
+
+                      {/* Status indicator */}
+                      {message.type === 'ai' && (message.isCompleted || message.requiresConfirmation) && (
+                        <div className="flex items-center space-x-2 mb-2">
+                          {message.isCompleted && (
+                            <div className="flex items-center space-x-1 text-green-600">
+                              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                                <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                              </svg>
+                              <span className="text-xs">Completed</span>
+                            </div>
+                          )}
+                          {message.requiresConfirmation && (
+                            <div className="flex items-center space-x-1 text-yellow-600">
+                              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                              </svg>
+                              <span className="text-xs">Confirmation Required</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="text-sm leading-normal text-gray-800 prose prose-sm max-w-none">
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+                            h1: ({ children }) => <h1 className="text-lg font-normal mb-2">{children}</h1>,
+                            h2: ({ children }) => <h2 className="text-base font-normal mb-2">{children}</h2>,
+                            h3: ({ children }) => <h3 className="text-sm font-normal mb-1">{children}</h3>,
+                            ul: ({ children }) => <ul className="list-disc list-inside mb-2 space-y-1">{children}</ul>,
+                            ol: ({ children }) => <ol className="list-decimal list-inside mb-2 space-y-1">{children}</ol>,
+                            li: ({ children }) => <li className="text-sm">{children}</li>,
+                            code: ({ children, className }) => {
+                              const isInline = !className;
+                              return isInline ? (
+                                <code className="bg-gray-100 px-1 py-0.5 rounded text-xs font-mono">{children}</code>
+                              ) : (
+                                <code className="block bg-gray-100 p-2 rounded text-xs font-mono overflow-x-auto">{children}</code>
+                              );
+                            },
+                            pre: ({ children }) => <pre className="bg-gray-100 p-2 rounded text-xs font-mono overflow-x-auto mb-2">{children}</pre>,
+                            blockquote: ({ children }) => <blockquote className="border-l-4 border-gray-300 pl-3 italic text-gray-600 mb-2">{children}</blockquote>,
+                            strong: ({ children }) => <strong className="font-normal">{children}</strong>,
+                            em: ({ children }) => <em className="italic">{children}</em>,
+                            a: ({ children, href }) => <a href={href} className="text-blue-600 hover:text-blue-800 underline" target="_blank" rel="noopener noreferrer">{children}</a>,
+                            table: ({ children }) => <div className="overflow-x-auto mb-2"><table className="min-w-full border border-gray-200">{children}</table></div>,
+                            th: ({ children }) => <th className="border border-gray-200 px-2 py-1 text-left bg-gray-50 font-normal text-xs">{children}</th>,
+                            td: ({ children }) => <td className="border border-gray-200 px-2 py-1 text-xs">{children}</td>,
+                          }}
+                        >
+                          {message.content}
+                        </ReactMarkdown>
+                      </div>
+
+                      {/* AI Message Interaction Icons */}
+                      {message.type === 'ai' && (
+                        <div className="flex items-center space-x-2 mt-3 pt-2">
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Copy">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                            </svg>
+                          </button>
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Like">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 10h4.764a2 2 0 011.789 2.894l-3.5 7A2 2 0 0115.263 21h-4.017c-.163 0-.326-.02-.485-.06L7 20m7-10V5a2 2 0 00-2-2h-.095c-.5 0-.905.405-.905.905 0 .714-.211 1.412-.608 2.006L7 11v9m7-10h-2M7 20H5a2 2 0 01-2-2v-6a2 2 0 012-2h2.5" />
+                            </svg>
+                          </button>
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Dislike">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018c.163 0 .326.02.485.06L17 4m-7 10v5a2 2 0 002 2h.095c.5 0 .905-.405.905-.905 0-.714.211-1.412.608-2.006L17 13V4m-7 10h2" />
+                            </svg>
+                          </button>
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Speak">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                            </svg>
+                          </button>
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Edit">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                            </svg>
+                          </button>
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Share">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.367 2.684 3 3 0 00-5.367-2.684z" />
+                            </svg>
+                          </button>
+                          <button className="p-1 text-gray-400 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors" title="Regenerate">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Overlap handling buttons */}
+                      {message.hasOverlaps && message.overlapEvents && (
+                        <div className="mt-3 space-y-2">
+                          <div className="text-xs text-gray-500 mb-2">How would you like to handle this conflict?</div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              onClick={() => handleOverlapChoice('reschedule', message.overlapEvents, message.overlaps)}
+                              className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
+                            >
+                              Reschedule
+                            </button>
+                            <button
+                              onClick={() => handleOverlapChoice('cancel_conflicting', message.overlapEvents, message.overlaps)}
+                              className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
+                            >
+                              Cancel Conflicting
+                            </button>
+                            <button
+                              onClick={() => handleOverlapChoice('create_anyway', message.overlapEvents, message.overlaps)}
+                              className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
+                            >
+                              Create Anyway
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Tool confirmation buttons */}
+                      {(() => {
+                        const shouldShowConfirmation = message.requiresConfirmation && message.tools && message.toolResults;
+                        console.log('🔍 [DASHBOARD] Checking confirmation UI:', {
+                          messageId: message.id,
+                          requiresConfirmation: message.requiresConfirmation,
+                          hasTools: !!message.tools,
+                          hasToolResults: !!message.toolResults,
+                          shouldShowConfirmation,
+                          toolsCount: message.tools?.length || 0,
+                          toolResultsCount: message.toolResults?.length || 0
+                        });
+
+                        return shouldShowConfirmation ? (
+                          <div className="mt-3 space-y-2">
+                            <div className="text-xs text-gray-500 mb-2">Please confirm these tools:</div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                onClick={() => handleConfirmActions(message.tools, message.toolResults)}
+                                className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
+                              >
+                                Confirm All
+                              </button>
+                              <button
+                                onClick={() => handleCancelActions()}
+                                className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
+                              >
+                                Cancel All
+                              </button>
+                            </div>
+                          </div>
+                        ) : null;
+                      })()}
+                    </div>
+
+                    {/* Tool indicator - separate bubble below message */}
+                    {message.type === 'ai' && message.tools && message.tools.length > 0 && (
+                      <div className="mt-2 max-w-[80%]">
+                        <div className={`px-4 py-3 rounded-2xl border transition-colors ${message.isProcessing
+                          ? 'bg-white border border-gray-100'
+                          : 'bg-green-50 border border-green-200'
+                          }`}>
+                          <div className="flex items-center space-x-2">
+                            {message.isProcessing ? (
+                              <div className="w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></div>
+                            ) : (
+                              <svg className="w-3 h-3 text-green-600" fill="currentColor" viewBox="0 0 20 20">
+                                <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                              </svg>
+                            )}
+                            <span className={`text-xs ${message.isProcessing ? 'text-gray-600' : 'text-green-600'
+                              }`}>
+                              {message.tools.map((tool, idx) => (
+                                <span key={idx}>
+                                  {tool.name === 'create_event' && (message.isProcessing ? 'Creating event...' : 'Event created')}
+                                  {tool.name === 'query_events' && (message.isProcessing ? 'Querying calendar...' : 'Calendar queried')}
+                                  {tool.name === 'update_event' && (message.isProcessing ? 'Updating event...' : 'Event updated')}
+                                  {tool.name === 'delete_event' && (message.isProcessing ? 'Deleting event...' : 'Event deleted')}
+                                  {idx < message.tools.length - 1 && ', '}
+                                </span>
+                              ))}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+              {isTyping && (
+                <div className="flex justify-start">
+                  <div className="bg-gray-100 text-gray-800 px-4 py-3 rounded-lg max-w-[80%]">
+                    <div className="flex space-x-1">
+                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
+                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Chat Input */}
+            <div className="p-1 flex-shrink-0">
+              <form onSubmit={handleSendMessage} className="space-y-2">
+                {/* Main input box */}
+                <div className="relative">
+                  <textarea
+                    value={inputMessage}
+                    onChange={(e) => setInputMessage(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        if (inputMessage.trim() && !isTyping) {
+                          handleSendMessage(e);
+                        }
+                      }
+                    }}
+                    className="w-full bg-white border border-gray-100 rounded-2xl px-4 py-3 pr-12 resize-none text-sm outline-none min-h-[56px] overflow-hidden"
+                    placeholder=""
+                    disabled={isTyping}
+                    rows="1"
+                    style={{
+                      height: 'auto',
+                      minHeight: '56px'
+                    }}
+                    onInput={(e) => {
+                      e.target.style.height = 'auto';
+                      e.target.style.height = Math.max(e.target.scrollHeight, 56) + 'px';
+                    }}
+                  />
+                  <button
+                    type="submit"
+                    disabled={!inputMessage.trim() || isTyping}
+                    className="absolute right-3 w-8 h-8 bg-black text-white rounded-full hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center"
+                    style={{
+                      height: '36px',
+                      width: '36px',
+                      top: '50%',
+                      transform: 'translateY(-50%)'
+                    }}
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                    </svg>
+                  </button>
+                </div>
+
+                {/* Icons below the input */}
+                <div className="flex items-center justify-between px-2">
+                  <div className="flex items-center space-x-3">
+                    <button
+                      type="button"
+                      className="p-1 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors"
+                      title="Add attachment"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className="flex items-center space-x-1 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors px-1 py-1"
+                      title="Tools"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      </svg>
+                      <span className="text-sm">Tools</span>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="p-1 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors"
+                    title="Voice input"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                    </svg>
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Pomodoro timer only shows in notification overlay - no main page timer */}
 
       {/* Pomodoro Focus Overlay - Full Screen */}
       {pomodoroState !== 'idle' && isRunning && (
-        <div className="fixed top-0 left-0 w-full h-full bg-slate-950 z-50 flex items-center justify-center" style={{ margin: 0, padding: 0 }}>
-          <div className="text-center">
-            {/* Timer Display - The Hero Element */}
-            <div className={`text-8xl font-light tracking-wider mb-8 ${pomodoroState === 'work' ? 'text-slate-100' : 'text-emerald-300'}`}>
+        <div className="fixed top-0 left-0 w-full h-full bg-white z-50 flex items-center justify-center">
+          <div className="text-center max-w-md mx-auto px-6">
+            {/* Timer Display - Clean and Minimal */}
+            <div className={`text-7xl font-light tracking-wide mb-6 ${pomodoroState === 'work' ? 'text-gray-900' : 'text-green-600'}`}>
               {formatTime(timeLeft)}
             </div>
-            
-            {/* Session Type - Subtle but Clear */}
-            <div className="text-lg text-slate-400 mb-12 tracking-wide">
-              {pomodoroState === 'work' ? 'FOCUS SESSION' : 'BREAK TIME'}
+
+            {/* Session Type - Clean Typography */}
+            <div className="text-base font-normal text-gray-600 mb-8 tracking-wide">
+              {pomodoroState === 'work' ? 'Focus Session' : 'Break Time'}
             </div>
-            
-            {/* Minimal Controls - Fade in on hover */}
-            <div className="opacity-30 hover:opacity-100 transition-opacity duration-500">
-              <div className="flex justify-center space-x-6">
-                {!isRunning ? (
-                  <button
-                    onClick={resumePomodoro}
-                    className="px-8 py-3 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 transition-all duration-300 border border-slate-600 hover:border-slate-500"
-                  >
-                    <Play className="h-4 w-4 inline mr-2" />
-                    Resume
-                  </button>
-                ) : (
-                  <button
-                    onClick={pausePomodoro}
-                    className="px-8 py-3 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 transition-all duration-300 border border-slate-600 hover:border-slate-500"
-                  >
-                    <Pause className="h-4 w-4 inline mr-2" />
-                    Pause
-                  </button>
-                )}
+
+            {/* Clean Controls */}
+            <div className="flex justify-center space-x-4 mb-8">
+              {!isRunning ? (
                 <button
-                  onClick={resetPomodoro}
-                  className="px-8 py-3 bg-slate-800 text-slate-200 rounded-lg hover:bg-slate-700 transition-all duration-300 border border-slate-600 hover:border-slate-500"
+                  onClick={resumePomodoro}
+                  className="px-6 py-2.5 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors duration-200 font-normal text-sm flex items-center space-x-2"
                 >
-                  <RotateCcw className="h-4 w-4 inline mr-2" />
-                  Stop
+                  <Play className="h-4 w-4" />
+                  <span>Resume</span>
                 </button>
-              </div>
+              ) : (
+                <button
+                  onClick={pausePomodoro}
+                  className="px-6 py-2.5 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors duration-200 font-normal text-sm flex items-center space-x-2"
+                >
+                  <Pause className="h-4 w-4" />
+                  <span>Pause</span>
+                </button>
+              )}
+              <button
+                onClick={resetPomodoro}
+                className="px-6 py-2.5 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors duration-200 font-normal text-sm flex items-center space-x-2"
+              >
+                <RotateCcw className="h-4 w-4" />
+                <span>Stop</span>
+              </button>
             </div>
-            
-            {/* Subtle Progress Indicator */}
-            <div className="mt-16 w-32 h-1 bg-slate-800 mx-auto rounded-full overflow-hidden">
-              <div 
-                className={`h-full transition-all duration-1000 ease-out ${pomodoroState === 'work' ? 'bg-slate-100' : 'bg-emerald-400'}`}
-                style={{ 
-                  width: `${((workDuration * 60 - timeLeft) / (workDuration * 60)) * 100}%` 
+
+            {/* Clean Progress Indicator */}
+            <div className="w-48 h-1 bg-gray-200 mx-auto rounded-full overflow-hidden">
+              <div
+                className={`h-full transition-all duration-1000 ease-out ${pomodoroState === 'work' ? 'bg-gray-900' : 'bg-green-500'}`}
+                style={{
+                  width: `${((workDuration * 60 - timeLeft) / (workDuration * 60)) * 100}%`
                 }}
               ></div>
             </div>
@@ -1353,79 +1787,86 @@ const Dashboard = () => {
       {showPomodoroNotification && pomodoroNotificationData && (() => {
         const userLang = detectUserLanguage();
         const texts = getPomodoroTexts(userLang);
-        
+
         return (
-          <div className="fixed inset-0 bg-gray-900 bg-opacity-60 z-50 flex items-center justify-center">
-            <div className="bg-white rounded-xl p-8 shadow-2xl max-w-sm mx-4 text-center">
-              <div className="text-5xl mb-6">🍅</div>
-              
+          <div className="fixed inset-0 bg-gray-900 bg-opacity-50 z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl p-6 shadow-xl max-w-sm w-full text-center">
+              {/* Clean Timer Icon */}
+              <div className="text-3xl mb-4">⏱️</div>
+
               {/* Show Timer if Pomodoro is running */}
               {pomodoroState !== 'idle' && isRunning ? (
                 <>
-                  <div className={`text-4xl font-bold mb-4 ${pomodoroState === 'work' ? 'text-red-600' : 'text-green-600'}`}>
+                  <div className={`text-2xl font-light mb-3 ${pomodoroState === 'work' ? 'text-gray-900' : 'text-green-600'}`}>
                     {formatTime(timeLeft)}
                   </div>
-                  <div className="text-lg text-gray-600 mb-6">
+                  <div className="text-sm text-gray-600 mb-4">
                     {pomodoroState === 'work' ? `${workDuration}min Focus Time` : `${breakDuration}min Break Time`}
                   </div>
-                  
-                  {/* Timer Controls */}
-                  <div className="flex justify-center space-x-3 mb-6">
+
+                  {/* Clean Timer Controls */}
+                  <div className="flex justify-center space-x-3 mb-4">
                     <button
                       onClick={pausePomodoro}
-                      className="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors flex items-center space-x-2"
+                      className="px-4 py-2 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors text-sm font-normal flex items-center space-x-2"
                     >
-                      <Pause className="h-4 w-4" />
+                      <Pause className="h-3 w-3" />
                       <span>Pause</span>
                     </button>
                     <button
                       onClick={resetPomodoro}
-                      className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors flex items-center space-x-2"
+                      className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors text-sm font-normal flex items-center space-x-2"
                     >
-                      <RotateCcw className="h-4 w-4" />
+                      <RotateCcw className="h-3 w-3" />
                       <span>Stop</span>
                     </button>
                   </div>
-                  
-                  <div className="text-sm text-gray-500 mb-6">
-                    {pomodoroState === 'work' ? 'Stay focused! You can do this! 💪' : 'Take a well-deserved break! 😌'}
+
+                  <div className="text-xs text-gray-500">
+                    {pomodoroState === 'work' ? 'Stay focused! You can do this!' : 'Take a well-deserved break!'}
                   </div>
                 </>
               ) : (
                 <>
-                  {/* Main Message */}
-                  <div className="text-lg font-medium text-gray-800 mb-4 leading-relaxed">
+                  {/* Clean Main Message */}
+                  <div className="text-sm font-normal text-gray-800 mb-4 leading-relaxed">
                     {pomodoroNotificationData.message}
                   </div>
-                  
-                  {/* Focus & Preparation */}
+
+                  {/* Clean Focus & Preparation */}
                   {(pomodoroNotificationData.focus || pomodoroNotificationData.preparation) && (
-                    <div className="text-sm text-gray-600 mb-6 space-y-1">
+                    <div className="text-xs text-gray-600 mb-4 space-y-2">
                       {pomodoroNotificationData.focus && (
-                        <div>🎯 {pomodoroNotificationData.focus}</div>
+                        <div className="flex items-center justify-center space-x-2">
+                          <span className="text-gray-400">•</span>
+                          <span>{pomodoroNotificationData.focus}</span>
+                        </div>
                       )}
                       {pomodoroNotificationData.preparation && (
-                        <div>📝 {pomodoroNotificationData.preparation}</div>
+                        <div className="flex items-center justify-center space-x-2">
+                          <span className="text-gray-400">•</span>
+                          <span>{pomodoroNotificationData.preparation}</span>
+                        </div>
                       )}
                     </div>
                   )}
-                  
-                  {/* Simple Session Info */}
-                  <div className="bg-gradient-to-r from-blue-50 to-purple-50 rounded-lg p-4 mb-6">
-                    <div className="flex justify-center items-center space-x-6 text-sm">
+
+                  {/* Clean Session Info */}
+                  <div className="bg-gray-50 rounded-lg p-4 mb-6">
+                    <div className="flex justify-center items-center space-x-8 text-sm">
                       <div className="text-center">
-                        <div className="text-2xl font-bold text-blue-600">{pomodoroNotificationData.workDuration}</div>
-                        <div className="text-gray-600">min work</div>
+                        <div className="text-xl font-normal text-gray-900">{pomodoroNotificationData.workDuration}</div>
+                        <div className="text-gray-500 text-xs">min work</div>
                       </div>
-                      <div className="text-gray-400">+</div>
+                      <div className="text-gray-300">+</div>
                       <div className="text-center">
-                        <div className="text-2xl font-bold text-purple-600">{pomodoroNotificationData.breakDuration}</div>
-                        <div className="text-gray-600">min break</div>
+                        <div className="text-xl font-normal text-gray-900">{pomodoroNotificationData.breakDuration}</div>
+                        <div className="text-gray-500 text-xs">min break</div>
                       </div>
                     </div>
                   </div>
-                  
-                  {/* Action Buttons */}
+
+                  {/* Clean Action Buttons */}
                   <div className="flex space-x-3">
                     <button
                       onClick={() => {
@@ -1433,7 +1874,7 @@ const Dashboard = () => {
                         setShowPomodoroNotification(false);
                         setPomodoroNotificationData(null);
                       }}
-                      className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-600 to-purple-600 text-white rounded-lg hover:from-blue-700 hover:to-purple-700 transition-all shadow-sm font-medium"
+                      className="flex-1 px-6 py-3 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors font-normal text-sm"
                     >
                       {texts.startButton}
                     </button>
@@ -1442,7 +1883,7 @@ const Dashboard = () => {
                         setShowPomodoroNotification(false);
                         setPomodoroNotificationData(null);
                       }}
-                      className="px-6 py-3 bg-gray-100 text-gray-600 rounded-lg hover:bg-gray-200 transition-colors font-medium"
+                      className="px-6 py-3 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors font-normal text-sm"
                     >
                       {texts.notNowButton}
                     </button>

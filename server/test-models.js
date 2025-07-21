@@ -37,11 +37,12 @@ async function testModel(modelName) {
 
 async function testAllModels() {
   const models = [
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
+    'gemini-2.5-pro',
+    'gemini-2.5-flash',
     'gemini-2.0-flash',
-    'gemini-2.0-flash-exp',
-    'gemini-1.0-pro'
+    'gemini-1.5-flash-8b',
+    'gemini-2.0-flash-lite',
+    'gemma-3-4b-it'
   ];
   
   console.log('🚀 Testing Gemini Models for Availability...\n');

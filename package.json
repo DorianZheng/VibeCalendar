@@ -11,10 +11,18 @@
     "install-all": "npm install && cd server && npm install && cd ../client && npm install",
     "start": "cd server && npm start"
   },
-  "keywords": ["calendar", "ai", "scheduling", "google-calendar"],
+  "keywords": [
+    "calendar",
+    "ai",
+    "scheduling",
+    "google-calendar"
+  ],
   "author": "VibeCalendar Team",
   "license": "MIT",
   "devDependencies": {
     "concurrently": "^8.2.2"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1"
   }
-} 
+}

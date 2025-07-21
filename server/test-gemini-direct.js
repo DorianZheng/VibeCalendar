@@ -60,7 +60,7 @@ Please provide a JSON response with the following structure:
 `;
 
     console.log('📤 Sending request to Gemini API...');
-    const data = await geminiGenerateContent({ model: 'gemini-1.5-pro', prompt });
+    const data = await geminiGenerateContent({ model: 'gemini-2.5-pro', prompt });
     
     console.log('✅ Gemini API Response received!');
     console.log('📊 Response structure:', Object.keys(data));
