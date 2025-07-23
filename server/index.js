@@ -17,32 +17,25 @@ dotenv.config();
 // Global model configuration - single source of truth for all model selections
 const GLOBAL_MODEL_CONFIG = {
   // Primary model to use for all AI operations (using faster model for better performance)
-  primaryModel: 'gemini-2.5-flash',
+  // primaryModel: 'gemini-2.5-flash',
+  primaryModel: 'gemini-2.5-pro',
 
   // Fallback models in order of preference (prioritizing faster models)
   fallbackModels: [
-    'gemini-2.5-pro', // Keep pro as first fallback for complex tasks
+    'gemini-2.5-flash',
     'gemini-2.0-flash',
-    'gemini-1.5-flash-8b',
     'gemini-2.0-flash-lite',
     'gemini-2.0-flash-001',
-    'gemini-1.5-flash-8b-001',
     'gemini-2.0-flash-lite-001',
-    'gemini-2.0-flash-lite-preview-02-05',
-    'gemini-2.0-flash-lite-preview',
-    'gemini-2.5-flash-preview-05-20',
-    'gemini-2.5-flash-lite-preview-06-17',
-    'learnlm-2.0-flash-experimental',
-    'gemma-3-4b-it',
-    'gemma-3-12b-it',
-    'gemma-3-27b-it',
-    'gemma-3n-e4b-it',
-    'gemma-3n-e2b-it'
   ],
 
   // Get the current model to use (can be overridden by session preferences)
-  getCurrentModel: (sessionModel = null) => {
-    return sessionModel || GLOBAL_MODEL_CONFIG.primaryModel;
+  getCurrentModel: (sessionId = null) => {
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId);
+      return session.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel;
+    }
+    return GLOBAL_MODEL_CONFIG.primaryModel;
   },
 
   // Update configuration based on available models from API
@@ -104,25 +97,6 @@ const GLOBAL_MODEL_CONFIG = {
 
     return updatedSessions;
   }
-};
-
-// Language detection helper
-const detectLanguage = (text) => {
-  // Simple language detection based on character sets
-  const chineseRegex = /[\u4e00-\u9fff]/;
-  const japaneseRegex = /[\u3040-\u309f\u30a0-\u30ff]/;
-  const koreanRegex = /[\uac00-\ud7af]/;
-  const arabicRegex = /[\u0600-\u06ff]/;
-  const cyrillicRegex = /[\u0400-\u04ff]/;
-
-  if (chineseRegex.test(text)) return 'Chinese';
-  if (japaneseRegex.test(text)) return 'Japanese';
-  if (koreanRegex.test(text)) return 'Korean';
-  if (arabicRegex.test(text)) return 'Arabic';
-  if (cyrillicRegex.test(text)) return 'Cyrillic';
-
-  // Default to English for Latin scripts
-  return 'English';
 };
 
 // Tool handlers registry - easily extensible for future tools
@@ -207,7 +181,7 @@ const toolHandlers = {
   },
 
   'query_events': {
-    description: "Search and display events with their IDs.",
+    description: "Access user's Google Calendar to view scheduled events and find available time slots.",
     parameters: {
       criteria: {
         required: true,
@@ -225,8 +199,14 @@ const toolHandlers = {
       message: { desc: "User message" }
     },
     handler: async (parameters, sessionId, oauth2Client) => {
+      // Handle both direct parameters and nested criteria format
       const { criteria = {} } = parameters;
-      const { startDate, endDate, searchTerm } = criteria;
+      let { startDate, endDate, searchTerm } = criteria;
+
+      // If not found in criteria, check direct parameters (AI often sends them this way)
+      if (!startDate && parameters.startDate) startDate = parameters.startDate;
+      if (!endDate && parameters.endDate) endDate = parameters.endDate;
+      if (!searchTerm && parameters.searchTerm) searchTerm = parameters.searchTerm;
 
       // Validate and format dates
       let validStartDate, validEndDate;
@@ -299,7 +279,7 @@ const toolHandlers = {
   },
 
   'update_event': {
-    description: "Update an event (confirmation required).",
+    description: "Update an existing event in the calendar.",
     parameters: {
       eventId: { required: true, desc: "ID of event to update" },
       event: {
@@ -380,13 +360,11 @@ const toolHandlers = {
     requiresConfirmation: true
   },
 
-
-
   'delete_event': {
-    description: "Delete an event (confirmation required).",
+    description: "Delete an event from the calendar.",
     parameters: {
       eventId: { required: true, desc: "ID of event to delete" },
-      eventTitle: { required: false, desc: "Title for confirmation" }
+      eventTitle: { required: false, desc: "Title of the event" }
     },
     returns: {
       success: { desc: "Tool success status" },
@@ -398,14 +376,103 @@ const toolHandlers = {
         throw new Error('Missing event ID');
       }
 
-      // For delete events that require confirmation, we don't delete immediately
-      // Instead, we return success and let the confirmation process handle the actual deletion
-      return {
-        success: true,
-        message: `Event "${eventTitle || 'Unknown'}" will be deleted after confirmation.`
-      };
+      console.log('🗑️ [SERVER] Deleting calendar event:', {
+        eventId,
+        eventTitle: eventTitle || 'Unknown',
+        sessionId: sessionId.substring(0, 8) + '...'
+      });
+
+      try {
+        // Enforce rate limiting before making API call
+        await enforceCalendarRateLimit(sessionId, 'delete');
+
+        const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+        console.log('🌐 [SERVER] Making Google Calendar API call to delete event...', {
+          sessionId: sessionId.substring(0, 8) + '...',
+          calendarId: 'primary',
+          eventId
+        });
+
+        // Retry logic for rate limiting with better backoff
+        let retryCount = 0;
+        const maxRetries = 5;
+        const baseDelay = 2000; // 2 seconds base delay
+
+        while (retryCount <= maxRetries) {
+          try {
+            await calendar.events.delete({
+              calendarId: 'primary',
+              eventId: eventId,
+              sendUpdates: 'all'
+            });
+            break; // Success, exit retry loop
+          } catch (error) {
+            if (error.code === 429 && retryCount < maxRetries) {
+              // Exponential backoff with jitter: 2s, 4s, 8s, 16s, 32s
+              const delay = baseDelay * Math.pow(2, retryCount) + Math.random() * 1000;
+              console.log(`⏳ [SERVER] Rate limited, retrying in ${Math.round(delay)}ms (attempt ${retryCount + 1}/${maxRetries})`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              retryCount++;
+            } else {
+              throw error; // Re-throw if not a 429 error or max retries reached
+            }
+          }
+        }
+
+        console.log('✅ [SERVER] Google Calendar API event deleted:', {
+          sessionId: sessionId.substring(0, 8) + '...',
+          eventId,
+          eventTitle: eventTitle || 'Unknown'
+        });
+
+        return {
+          success: true,
+          message: `Event "${eventTitle || 'Unknown'}" deleted successfully!`,
+          eventId: eventId,
+          eventTitle: eventTitle
+        };
+
+      } catch (error) {
+        console.error('❌ [SERVER] Delete event error:', {
+          error: error.message,
+          status: error.code,
+          sessionId: sessionId.substring(0, 8) + '...',
+          eventId,
+          eventTitle: eventTitle || 'Unknown'
+        });
+
+        // Handle specific error cases
+        let errorMessage = 'Failed to delete calendar event';
+
+        if (error.code === 410) {
+          // Event was already deleted - this is actually a success case
+          return {
+            success: true,
+            message: `Event "${eventTitle || 'Unknown'}" was already deleted`,
+            eventId: eventId,
+            eventTitle: eventTitle
+          };
+        } else if (error.code === 401) {
+          errorMessage = 'Authentication failed - please reconnect your Google Calendar';
+        } else if (error.code === 403) {
+          errorMessage = 'Permission denied - check your Google Calendar permissions';
+        } else if (error.code === 404) {
+          errorMessage = 'Event not found - it may have been deleted already';
+        } else if (error.code === 429) {
+          errorMessage = 'Rate limit exceeded - please try again later';
+        }
+
+        return {
+          success: false,
+          message: errorMessage,
+          error: error.message,
+          eventId: eventId,
+          eventTitle: eventTitle
+        };
+      }
     },
-    requiresConfirmation: true
+    requiresConfirmation: true  // Server-side only, AI doesn't see this
   }
 
   // Easy to add new tools here:
@@ -421,14 +488,86 @@ const toolHandlers = {
 // Global rate limiting for calendar operations
 const calendarRateLimiter = new Map(); // sessionId -> lastOperationTime
 
-// Helper function to add delays between API calls to prevent rate limiting
-const addApiDelay = async (toolName, index) => {
-  if (index > 0 && (toolName === 'create_event' || toolName === 'update_event' || toolName === 'delete_event' || toolName === 'query_events')) {
-    const delay = 1000; // 1 second delay between calendar API calls
-    console.log(`⏳ [SERVER] Adding ${delay}ms delay between calendar API calls`);
-    await new Promise(resolve => setTimeout(resolve, delay));
+// Track pending confirmations and their SSE connections
+const pendingConfirmations = new Map(); // sessionId -> { res, sendSSE, tools, aiResponse, currentConversationHistory }
+
+// Helper function to continue SSE processing after confirmation
+async function continueSSEAfterConfirmation(sessionId, updatedConversationHistory, toolResults, wasCancelled) {
+  const pendingContext = pendingConfirmations.get(sessionId);
+  if (!pendingContext) {
+    console.error('❌ [SSE] No pending context found for session:', sessionId.substring(0, 8) + '...');
+    return;
   }
-};
+
+  const { res, sendSSE, userSession } = pendingContext;
+
+  try {
+    // Update user session with new conversation history
+    userSession.conversationHistory = updatedConversationHistory;
+    sessions.set(sessionId, userSession);
+    await saveSessions();
+
+    if (wasCancelled) {
+      // Handle cancellation with AI
+      const userTimezone = userSession.timezone || 'UTC';
+      const cancellationSystemPrompt = generateGlobalSystemPrompt(userTimezone);
+      const cancellationResponse = await callModel({
+        model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
+        conversationHistory: updatedConversationHistory,
+        currentMessage: '',
+        systemPrompt: cancellationSystemPrompt,
+        sessionId: sessionId
+      });
+
+      const cancellationText = cancellationResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || 'Operations cancelled.';
+      const parsedCancellation = parseAiResponse(cancellationText);
+
+      // Update conversation history with cancellation response
+      userSession.conversationHistory = [
+        ...updatedConversationHistory,
+        { role: 'model', content: parsedCancellation.message, timestamp: new Date() }
+      ];
+      sessions.set(sessionId, userSession);
+      await saveSessions();
+
+      console.log('✅ [SSE] Sending cancellation message:', parsedCancellation.message.substring(0, 100) + '...');
+      sendSSE({ type: 'final', message: parsedCancellation.message });
+      res.end();
+      return;
+    }
+
+    // Handle successful tool execution with AI summary
+    const userTimezone = userSession.timezone || 'UTC';
+    const summarySystemPrompt = generateGlobalSystemPrompt(userTimezone);
+    const finalResponse = await callModel({
+      model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
+      conversationHistory: updatedConversationHistory,
+      currentMessage: '',
+      systemPrompt: summarySystemPrompt,
+      sessionId: sessionId
+    });
+
+    const finalText = finalResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || 'Operations completed.';
+    const parsedFinalResponse = parseAiResponse(finalText);
+
+    // Update conversation history with final AI response
+    userSession.conversationHistory = [
+      ...updatedConversationHistory,
+      { role: 'model', content: parsedFinalResponse.message, timestamp: new Date() }
+    ];
+    sessions.set(sessionId, userSession);
+    await saveSessions();
+
+    console.log('✅ [SSE] Sending final message:', parsedFinalResponse.message.substring(0, 100) + '...');
+    sendSSE({ type: 'final', message: parsedFinalResponse.message });
+    res.end();
+
+  } catch (error) {
+    console.error('❌ [SSE] Error continuing after confirmation:', error);
+    sendSSE({ type: 'final', message: 'Sorry, an error occurred during processing.' });
+    res.end();
+  }
+}
 
 // Helper function to enforce rate limiting for calendar operations
 const enforceCalendarRateLimit = async (sessionId, operationType = 'calendar') => {
@@ -445,8 +584,10 @@ const enforceCalendarRateLimit = async (sessionId, operationType = 'calendar') =
   calendarRateLimiter.set(sessionId, Date.now());
 };
 
-// Generate concise tool/parameter prompt for the AI
-function generateToolParameterPrompt() {
+// Generate global system prompt for AI assistant
+function generateGlobalSystemPrompt(userTimezone = 'UTC') {
+  const currentTimeInUserTZ = new Date().toLocaleString('en-US', { timeZone: userTimezone });
+  // Inline the tool parameter prompt logic here
   let out = 'TOOLS:';
   for (const [tool, def] of Object.entries(toolHandlers)) {
     out += `\n- ${tool}: ${def.description}`;
@@ -470,17 +611,92 @@ function generateToolParameterPrompt() {
       }
     }
   }
-  return out;
+  const finalToolPrompt = out;
+
+  return `You are Vibe, a friendly personal assistant. Respond in the same language as the user. Apart from your own knowledge, you have access to the following tools to serve the user:
+
+AVAILABLE TOOLS:
+${finalToolPrompt}
+
+TOOL CALLING FORMAT:
+- To call a tool, respond with a JSON object in the following format:
+  {
+    "tools": [
+      { "tool": "tool_name", "parameters": { ... } }
+    ],
+    "message": "your natural language reply"
+  }
+
+CRITICAL RULES:
+- If you need to call a tool, respond with only the JSON object as described above. Do not put natural language outside the JSON object. Do not mix natural language with the JSON object.
+- NEVER embed tool results like [{"success": true...}] in your natural language responses.
+- When you see "TOOL_RESULTS:" messages, these contain results from tools you previously called. Use this information naturally in your responses, but NEVER mention "tool output", "tool results", or reference the technical JSON format to users.
+
+CONTEXT:
+User timezone: ${userTimezone}
+Current time: ${currentTimeInUserTZ}`;
 }
 
-// Generate tool descriptions for AI prompt
-const generateToolDescriptions = () => {
-  return Object.entries(toolHandlers)
-    .map(([toolName, config]) => `- ${toolName}: ${config.description}`)
-    .join('\n');
-};
+// Parse AI response and extract tools if any
+function parseAiResponse(aiResponseText) {
+  try {
+    let cleanResponse = aiResponseText.trim();
 
+    // Look for JSON in code blocks first
+    const jsonMatch = cleanResponse.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```$/);
+    if (jsonMatch) {
+      cleanResponse = jsonMatch[1];
+    } else {
+      // Only look for JSON if it looks like a tool calling response
+      // (starts with { and contains "tools" array)
+      const startsWithBrace = cleanResponse.startsWith('{');
+      const endsWithBrace = cleanResponse.endsWith('}');
+      const containsTools = cleanResponse.includes('"tools"');
 
+      if (startsWithBrace && endsWithBrace && containsTools) {
+        // This might be a tool calling response
+        const lastBraceIndex = cleanResponse.lastIndexOf('}');
+        if (lastBraceIndex !== -1) {
+          const firstBraceIndex = cleanResponse.indexOf('{');
+          if (firstBraceIndex !== -1 && firstBraceIndex < lastBraceIndex) {
+            cleanResponse = cleanResponse.substring(firstBraceIndex, lastBraceIndex + 1);
+          }
+        }
+      } else {
+        // This is plain text, not a tool calling response
+        return {
+          tools: [],
+          message: aiResponseText,
+          isJson: false
+        };
+      }
+    }
+
+    const parsed = JSON.parse(cleanResponse);
+
+    // Only treat as valid tool response if it has tools array
+    if (parsed.tools && Array.isArray(parsed.tools)) {
+      return {
+        tools: parsed.tools || [],
+        message: parsed.message || aiResponseText,
+        isJson: true
+      };
+    } else {
+      // Not a valid tool response, treat as plain text
+      return {
+        tools: [],
+        message: aiResponseText,
+        isJson: false
+      };
+    }
+  } catch (parseError) {
+    return {
+      tools: [],
+      message: aiResponseText,
+      isJson: false
+    };
+  }
+}
 
 // Generic tool processor
 const processTool = async (tool, parameters, sessionId, oauth2Client) => {
@@ -544,8 +760,6 @@ if (proxyConfig.http || proxyConfig.https) {
 // Persistent session store
 const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 const sessions = new Map();
-
-
 
 // Load sessions from file on startup
 const loadSessions = async () => {
@@ -692,9 +906,10 @@ const geminiProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const geminiAgent = geminiProxy ? new (HttpsProxyAgent.HttpsProxyAgent || HttpsProxyAgent)(geminiProxy) : undefined;
 
-async function geminiGenerateContent({ model, conversationHistory = [], currentMessage, systemPrompt = null, retryCount = 0, fallbackAttempt = 0, sessionId = null }) {
+async function geminiGenerateContent({ model, conversationHistory = [], currentMessage, systemPrompt = null, retryCount = 0, fallbackAttempt = 0, sessionId = null, requestId = null }) {
   const maxRetries = 3;
   const baseDelay = 1000; // 1 second
+  const startTime = Date.now();
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`;
 
@@ -717,55 +932,102 @@ async function geminiGenerateContent({ model, conversationHistory = [], currentM
     }
   ];
 
-  // Log conversation history details for debugging
-  console.log('📝 [SERVER] Conversation history details:', {
-    conversationHistoryLength: conversationHistory?.length || 0,
-    roles: (conversationHistory || []).map(msg => msg.role),
-    contentPreview: (conversationHistory || []).map(msg => {
-      const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-      return contentStr.substring(0, 50) + '...';
-    })
-  });
-
   const body = { contents };
   const options = {
     headers: { 'Content-Type': 'application/json' },
-    timeout: fallbackAttempt > 0 ? 15000 : 25000 // Shorter timeout for fallback models
+    timeout: fallbackAttempt > 0 ? 20000 : 30000 // 30s for primary, 20s for fallbacks
   };
   if (geminiAgent) options.httpsAgent = geminiAgent;
 
-  // Track request for error logging
-  const requestId = generateExternalRequestId();
-  const startTime = Date.now();
+  // Log detailed request information (compact version)
+  // Always show system prompt + last 4 entries to preserve system prompt visibility
+  let recentContents;
+  let hasMoreContents = false;
+  
+  if (contents.length <= 5) {
+    // Show all contents if 5 or fewer
+    recentContents = contents;
+  } else {
+    // Show system prompt (first entry) + last 4 entries
+    const systemPromptEntry = contents[0];
+    const lastFourEntries = contents.slice(-4);
+    recentContents = [systemPromptEntry, ...lastFourEntries];
+    hasMoreContents = contents.length > 5;
+  }
 
-  console.log('🤖 [SERVER] Making Gemini API request:', {
+  console.log('🤖 [GEMINI REQUEST]:', {
     requestId,
+    model,
+    sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
     url: url.replace(geminiApiKey, '***API_KEY***'),
-    model: model,
-    conversationHistoryLength: conversationHistory?.length || 0,
-    currentMessageLength: currentMessage?.length || 0,
-    totalContentLength: JSON.stringify(contents).length,
-    hasProxy: !!geminiAgent,
-    proxyConfig: geminiProxy || 'none',
     timeout: options.timeout,
-    retryCount: retryCount,
-    fallbackAttempt: fallbackAttempt,
+    hasProxy: !!geminiAgent,
+    retryCount,
+    fallbackAttempt,
+    requestBody: {
+      contentsCount: contents.length,
+      systemPromptLength: systemPrompt?.length || 0,
+      conversationHistoryLength: conversationHistory?.length || 0,
+      currentMessageLength: currentMessage?.length || 0,
+      totalInputTokensEstimate: JSON.stringify(body).length
+    },
+    contentsSummary: recentContents.map((content, summaryIndex) => {
+      // Find the actual index of this content in the original contents array
+      let actualIndex;
+      if (contents.length <= 5) {
+        actualIndex = summaryIndex;
+      } else {
+        // First entry is system prompt (index 0), rest are from the end
+        if (summaryIndex === 0) {
+          actualIndex = 0; // System prompt
+        } else {
+          actualIndex = contents.length - 4 + (summaryIndex - 1); // Last 4 entries
+        }
+      }
+      
+      return {
+        index: actualIndex,
+        role: content.role,
+        textLength: content.parts[0]?.text?.length || 0,
+        textPreview: content.parts[0]?.text?.substring(0, 200) + (content.parts[0]?.text?.length > 200 ? '...' : ''),
+        ...(hasMoreContents && summaryIndex === 1 ? { 
+          note: `... ${contents.length - 5} entries omitted between system prompt and recent messages ...` 
+        } : {})
+      };
+    }),
     timestamp: new Date().toISOString()
   });
 
   try {
     const response = await axios.post(url, body, options);
+    const endTime = Date.now();
+    const responseTime = endTime - startTime;
 
-    // Log response summary for debugging
-    const responseText = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (responseText) {
-      console.log('📝 [GEMINI] Response summary:', {
-        requestId,
-        model: model,
-        responseLength: responseText.length,
-        preview: responseText.substring(0, 1000) + (responseText.length > 1000 ? '...' : '')
-      });
-    }
+    // Log detailed response information
+    console.log('✅ [GEMINI RESPONSE]:', {
+      requestId,
+      model,
+      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
+      status: response.status,
+      responseTime: `${responseTime}ms`,
+      responseText: response.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No text content',
+      responseData: {
+        candidates: response.data.candidates?.map((candidate, index) => ({
+          index,
+          finishReason: candidate.finishReason,
+          contentLength: candidate.content?.parts?.[0]?.text?.length || 0,
+          contentPreview: candidate.content?.parts?.[0]?.text?.substring(0, 200) + (candidate.content?.parts?.[0]?.text?.length > 200 ? '...' : ''),
+          fullText: candidate.content?.parts?.[0]?.text || 'No text',
+          safetyRatings: candidate.safetyRatings?.map(rating => ({
+            category: rating.category,
+            probability: rating.probability
+          }))
+        })),
+        usageMetadata: response.data.usageMetadata,
+        promptFeedback: response.data.promptFeedback
+      },
+      timestamp: new Date().toISOString()
+    });
 
     // Mark model as available on success
     if (modelStatus[model]) {
@@ -775,23 +1037,30 @@ async function geminiGenerateContent({ model, conversationHistory = [], currentM
 
     return response.data;
   } catch (error) {
-    // Log external API error
-    logExternalError('GEMINI', error, requestId, startTime);
+    const endTime = Date.now();
+    const responseTime = endTime - startTime;
 
-    console.error('❌ [SERVER] Gemini API request failed:', {
+    // Log external API error
+    console.error('❌ [GEMINI ERROR]:', {
       requestId,
+      model,
+      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
       error: error.message,
       status: error.response?.status,
       statusText: error.response?.statusText,
-      responseData: error.response?.data,
+      responseTime: `${responseTime}ms`,
+      retryCount,
+      fallbackAttempt,
       requestUrl: url.replace(geminiApiKey, '***API_KEY***'),
       requestBody: {
-        model: model,
+        contentsCount: contents.length,
+        systemPromptLength: systemPrompt?.length || 0,
         conversationHistoryLength: conversationHistory?.length || 0,
         currentMessageLength: currentMessage?.length || 0,
-        hasProxy: !!geminiAgent
+        totalInputTokensEstimate: JSON.stringify(body).length
       },
-      retryCount: retryCount,
+      responseData: error.response?.data,
+      hasProxy: !!geminiAgent,
       timestamp: new Date().toISOString()
     });
 
@@ -812,13 +1081,57 @@ async function geminiGenerateContent({ model, conversationHistory = [], currentM
       fallbackCount: (modelFallbacks[model] || []).length
     });
 
-    // Retry logic for 503 errors (service overload) - retry with same model
-    if (error.response?.status === 503 && retryCount < maxRetries) {
+    // For 503 errors (service overload), switch to fallback models immediately instead of retrying
+    if (error.response?.status === 503) {
+      const fallbacks = modelFallbacks[model] || [];
+      
+      console.log(`🔄 [SERVER] Model ${model} is overloaded (503), switching to fallback models instead of retrying`);
+      
+      if (fallbackAttempt < fallbacks.length) {
+        const nextModel = fallbacks[fallbackAttempt];
+        console.log(`🔄 [SERVER] Switching from overloaded ${model} to fallback model: ${nextModel} (attempt ${fallbackAttempt + 1}/${fallbacks.length})`);
+        
+        // Update session's preferred model if sessionId is provided
+        if (sessionId && sessions.has(sessionId)) {
+          const session = sessions.get(sessionId);
+          session.preferredModel = nextModel;
+          sessions.set(sessionId, session);
+          await saveSessions();
+          console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${nextModel} due to 503 overload`);
+        }
+        
+        // Try with the next fallback model
+        return geminiGenerateContent({
+          model: nextModel,
+          currentMessage,
+          conversationHistory,
+          systemPrompt, // Preserve system prompt
+          retryCount: 0,
+          fallbackAttempt: fallbackAttempt + 1,
+          sessionId,
+          requestId
+        });
+      } else {
+        console.error(`❌ [SERVER] All fallback models exhausted for overloaded ${model}. No more models available.`);
+      }
+    }
+
+    // Retry logic for other server errors (but preserve system prompt)
+    if ((error.response?.status >= 500 || error.code === 'ECONNRESET') && retryCount < maxRetries) {
       const delay = baseDelay * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
-      console.log(`🔄 [SERVER] Retrying Gemini API request with same model ${model} in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+      console.log(`🔄 [SERVER] Server error ${error.response?.status || error.code}, retrying with same model ${model} in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
 
       await new Promise(resolve => setTimeout(resolve, delay));
-      return geminiGenerateContent({ model, currentMessage, conversationHistory, retryCount: retryCount + 1, sessionId });
+      return geminiGenerateContent({ 
+        model, 
+        currentMessage, 
+        conversationHistory, 
+        systemPrompt, // Preserve system prompt
+        retryCount: retryCount + 1, 
+        fallbackAttempt,
+        sessionId, 
+        requestId 
+      });
     }
 
     // Handle timeout errors by switching to faster models
@@ -860,9 +1173,11 @@ async function geminiGenerateContent({ model, conversationHistory = [], currentM
           model: nextModel,
           currentMessage,
           conversationHistory: optimizedHistory,
+          systemPrompt, // Preserve system prompt
           retryCount: 0,
           fallbackAttempt: fallbackAttempt + 1,
-          sessionId
+          sessionId,
+          requestId
         });
       } else {
         console.error(`❌ [SERVER] All fallback models exhausted for timeout recovery. No more models available.`);
@@ -970,9 +1285,11 @@ async function geminiGenerateContent({ model, conversationHistory = [], currentM
           model: nextModel,
           currentMessage,
           conversationHistory: compactedHistory,
+          systemPrompt, // Preserve system prompt
           retryCount: 0,
           fallbackAttempt: fallbackAttempt + 1,
-          sessionId
+          sessionId,
+          requestId
         });
       } else {
         console.error(`❌ [SERVER] All fallback models exhausted for ${model}. No more models available.`);
@@ -1566,7 +1883,7 @@ app.get('/api/auth/user', requireAuth, async (req, res) => {
 
 // Get user's calendar events
 app.get('/api/calendar/events', calendarLimiter, requireAuth, async (req, res) => {
-  const { timeMin, timeMax } = req.query;
+  const { timeMin, timeMax, searchTerm } = req.query;
   const sessionId = req.headers['x-session-id'];
 
 
@@ -1590,7 +1907,8 @@ app.get('/api/calendar/events', calendarLimiter, requireAuth, async (req, res) =
           timeMin: timeMin || new Date().toISOString(),
           timeMax: timeMax || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
           singleEvents: true,
-          orderBy: 'startTime'
+          orderBy: 'startTime',
+          q: searchTerm
         });
         break; // Success, exit retry loop
       } catch (error) {
@@ -1622,6 +1940,7 @@ app.get('/api/calendar/events', calendarLimiter, requireAuth, async (req, res) =
 // AI-powered event scheduling with Server-Sent Events
 app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
   const { description, sessionId, timezone } = req.query;
+  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
 
   // Custom auth check for SSE (since EventSource can't send custom headers)
   if (!sessionId || !sessions.has(sessionId)) {
@@ -1666,240 +1985,296 @@ app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  // Clean up pending confirmation if connection is closed
+  res.on('close', () => {
+    console.log('🔌 [SSE] Connection closed, scheduling cleanup for pending confirmation for session:', sessionId.substring(0, 8) + '...');
+    if (pendingConfirmations.has(sessionId)) {
+      // Set a timeout to delete after 2 minutes if not already deleted (increased from 30s to allow for longer reconnects)
+      const context = pendingConfirmations.get(sessionId);
+      context.cleanupTimeout = setTimeout(() => {
+        pendingConfirmations.delete(sessionId);
+        console.log(`🧹 [SSE] Cleaned up pending confirmation for session: ${sessionId} after timeout`);
+      }, 120000); // 2 minutes
+    }
+  });
+
   try {
     // Get user session for AI processing
     const userSession = sessions.get(sessionId);
     const userTimezone = timezone || 'UTC';
-    const currentTimeInUserTZ = new Date().toLocaleString('en-US', { timeZone: userTimezone });
 
     // Build system message for AI
-    const systemMessage = `You are Vibe, a friendly personal assistant. Respond in the same language as the user. You have access to the following tools:
-
-AVAILABLE TOOLS:
-${generateToolParameterPrompt()}
-
-CONTEXT:
-User timezone: ${userTimezone}
-Current time: ${currentTimeInUserTZ}
-
-CRITICAL RULES:
-- IF YOU NEED TO CALL TOOLS, MUST RESPOND WITH EXACTLY A JSON OBJECT IN THIS EXACT FORMAT:
-{
-  "tools": [
-    {
-      "tool": "tool_name", /* ONLY USE TOOLS DEFINED IN AVAILABLE TOOLS */
-      "parameters": { /* tool parameters as defined above. Follow the exact parameter structure shown in AVAILABLE TOOLS */ }
-    }
-  ],
-  "message": "Your response to the user while calling tools, in the user's language. Write human-readable messages in this field"
-} 
-- IF YOU CALL TOOLS, ALL NATURAL LANGUAGE RESPONSE MUST BE IN THE "message" FIELD. NO NATURAL LANGUAGE OUTSIDE OF THE "message" FIELD ALLOWED.
-`;
+    const systemPrompt = generateGlobalSystemPrompt(userTimezone);
 
     // Get conversation history
     let fullConversationHistory = userSession.conversationHistory || [];
 
-    // Apply compaction if needed
-    fullConversationHistory = await compactConversationHistory(fullConversationHistory, {
-      maxMessages: 40,
-      maxTotalLength: 25000,
-      preserveRecentMessages: 15,
-      useAI: true,
-      model: userSession.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel,
+            // Apply compaction if needed
+        fullConversationHistory = await compactConversationHistory(fullConversationHistory, {
+          maxMessages: 40,
+          maxTotalLength: 25000,
+          preserveRecentMessages: 15,
+          useAI: true,
+          model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
       sessionId: sessionId
     });
 
-    // Get AI response
-    const modelResult = await callModel({
-      model: userSession.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel,
-      conversationHistory: fullConversationHistory,
-      currentMessage: description,
-      systemPrompt: systemMessage,
-      sessionId: sessionId,
-      options: {
-        enableModelSwitching: true,
-        enableCompaction: true
-      }
-    });
+    // Unified AI conversation loop
+    setTimeout(async () => {
+      try {
+        let currentConversationHistory = fullConversationHistory; // Start with original history
+        let currentMessage = description; // Start with user's initial message
 
-    const data = modelResult.data;
-    const aiResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        while (true) {
+          // Get AI response
+          const modelResult = await callModel({
+            model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
+            conversationHistory: currentConversationHistory,
+            currentMessage: currentMessage,
+            systemPrompt: systemPrompt,
+            sessionId: sessionId,
+            requestId: requestId,
+            options: { enableModelSwitching: true, enableCompaction: currentMessage === '' }
+          });
 
-    // Try to parse the response as JSON
-    let aiResponseData;
-    try {
-      let cleanResponse = aiResponse.trim();
-      const jsonMatch = cleanResponse.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```$/);
-      if (jsonMatch) {
-        cleanResponse = jsonMatch[1];
-      } else {
-        const lastBraceIndex = cleanResponse.lastIndexOf('}');
-        if (lastBraceIndex !== -1) {
-          const firstBraceIndex = cleanResponse.indexOf('{');
-          if (firstBraceIndex !== -1 && firstBraceIndex < lastBraceIndex) {
-            cleanResponse = cleanResponse.substring(firstBraceIndex, lastBraceIndex + 1);
-          }
-        }
-      }
+          const aiResponseText = modelResult.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          const aiResponse = parseAiResponse(aiResponseText);
 
-      aiResponseData = JSON.parse(cleanResponse);
-
-      // Send intermittent message immediately if AI wants to use tools
-      if (aiResponseData.tools && aiResponseData.tools.length > 0) {
-        const intermittentMessage = aiResponseData.message;
-        console.log('💬 [SSE] Sending intermittent message:', intermittentMessage);
-        sendSSE({
-          type: 'intermittent',
-          message: intermittentMessage,
-          tools: aiResponseData.tools.map(t => ({
-            name: t.tool,
-            status: 'running'
-          }))
-        });
-
-        // Process tools in background and send final result
-        setTimeout(async () => {
-          try {
-            // Process the tools (simplified version)
-            const toolResults = [];
-            for (const toolRequest of aiResponseData.tools) {
-              try {
-                // Set up authenticated OAuth2 client
-                if (!userSession.tokens) {
-                  console.error('❌ [SSE] No OAuth tokens found for session');
-                  toolResults.push({ success: false, message: 'Please reconnect your Google Calendar' });
-                  continue;
-                }
-
-                const oauth2Client = new google.auth.OAuth2(
-                  process.env.GOOGLE_CLIENT_ID,
-                  process.env.GOOGLE_CLIENT_SECRET,
-                  process.env.GOOGLE_REDIRECT_URI
-                );
-                oauth2Client.setCredentials(userSession.tokens);
-
-                // Refresh token if needed
-                await refreshTokenIfNeeded(sessionId, userSession);
-
-                console.log('✅ [SSE] OAuth2 client authenticated for tool:', toolRequest.tool);
-
-                const toolResult = await processTool(
-                  toolRequest.tool,
-                  toolRequest.parameters,
-                  sessionId,
-                  oauth2Client
-                );
-
-                console.log('🔍 [SSE] Tool result received:', {
-                  tool: toolRequest.tool,
-                  success: toolResult.success,
-                  messageLength: toolResult.message?.length || 0,
-                  hasEvents: toolResult.events?.length || 0,
-                  resultKeys: Object.keys(toolResult || {}),
-                  resultPreview: JSON.stringify(toolResult, null, 2).substring(0, 200) + '...'
-                });
-
-                toolResults.push(toolResult);
-              } catch (toolError) {
-                console.error('❌ [SSE] Tool processing error:', toolError);
-
-                let errorMessage = `Failed to ${toolRequest.tool}`;
-                if (toolError.status === 403 || toolError.code === 403) {
-                  errorMessage = 'Google Calendar access denied. Please reconnect your account.';
-                } else if (toolError.status === 401 || toolError.code === 401) {
-                  errorMessage = 'Google Calendar authentication expired. Please reconnect your account.';
-                } else if (toolError.message && toolError.message.includes('unregistered callers')) {
-                  errorMessage = 'Calendar authentication issue. Please reconnect your Google Calendar.';
-                }
-
-                toolResults.push({ success: false, message: errorMessage });
-              }
-            }
-
-            // Generate final response
-            console.log('🔍 [SSE] All tool results collected:', {
-              toolResultsCount: toolResults.length,
-              toolResults: toolResults.map(r => ({
-                success: r.success,
-                messageLength: r.message?.length || 0,
-                hasEvents: r.events?.length || 0,
-                keys: Object.keys(r || {})
-              })),
-              fullResults: JSON.stringify(toolResults, null, 2).substring(0, 500) + '...'
-            });
-
-            const followUpResponse = await callModel({
-              model: userSession.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel,
-              conversationHistory: userSession.conversationHistory,
-              currentMessage: `${JSON.stringify(toolResults, null, 2)}`,
-              systemPrompt: systemMessage,
-              sessionId: sessionId,
-              options: {
-                enableModelSwitching: true,
-                enableCompaction: false
-              }
-            });
-
-            const followUpText = followUpResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-            // Update conversation history
-            userSession.conversationHistory = [
-              ...userSession.conversationHistory,
-              { role: 'user', content: description, timestamp: new Date() },
-              { role: 'model', content: followUpText, timestamp: new Date() }
+          // Add user message to conversation history (first iteration only)
+          if (currentMessage !== '') {
+            currentConversationHistory = [
+              ...currentConversationHistory,
+              { role: 'user', content: currentMessage, timestamp: new Date() }
             ];
+          }
+
+          // Add AI response to conversation history
+          currentConversationHistory = [
+            ...currentConversationHistory,
+            { role: 'model', content: aiResponse.message, timestamp: new Date() }
+          ];
+
+          // If no tools requested, send final response and exit
+          if (!aiResponse.tools || aiResponse.tools.length === 0) {
+            userSession.conversationHistory = currentConversationHistory;
             sessions.set(sessionId, userSession);
             await saveSessions();
 
-            console.log('✅ [SSE] Sending final message:', followUpText.substring(0, 100) + '...');
-            sendSSE({ type: 'final', message: followUpText });
+            console.log('✅ [SSE] Sending final message:', aiResponse.message.substring(0, 100) + '...');
+            sendSSE({ type: 'final', message: aiResponse.message });
             res.end();
-
-          } catch (processingError) {
-            console.error('❌ [SSE] Processing error:', processingError);
-            sendSSE({ type: 'final', message: intermittentMessage + '\n\n抱歉，处理过程中遇到了问题，请稍后再试。' });
-            res.end();
+            return;
           }
-        }, 100);
 
-      } else {
-        // No tools needed, just chat response
-        console.log('💬 [SSE] Direct chat response');
-        sendSSE({ type: 'final', message: aiResponseData.message || aiResponse });
+          // Check for confirmation requirement
+          const toolsRequiringConfirmation = aiResponse.tools.filter(t => {
+            const toolConfig = toolHandlers[t.tool];
+            return toolConfig && toolConfig.requiresConfirmation;
+          });
 
-        // Update conversation history
-        userSession.conversationHistory = [
-          ...userSession.conversationHistory,
-          { role: 'user', content: description, timestamp: new Date() },
-          { role: 'model', content: aiResponseData.message || aiResponse, timestamp: new Date() }
-        ];
-        sessions.set(sessionId, userSession);
-        await saveSessions();
+          if (toolsRequiringConfirmation.length > 0) {
+            console.log('⚠️ [SSE] Tools require confirmation, keeping connection alive');
 
+            // Store SSE context for later continuation
+            pendingConfirmations.set(sessionId, {
+              res,
+              sendSSE,
+              tools: aiResponse.tools,
+              aiResponse,
+              currentConversationHistory,
+              userSession
+            });
+
+            sendSSE({
+              type: 'confirmation',
+              message: aiResponse.message,
+              tools: aiResponse.tools,
+              requiresConfirmation: true
+            });
+
+            // Don't end connection - wait for confirm-tools to continue
+            return;
+          }
+
+          // Send intermittent message
+          console.log('🔄 [SSE] Processing tools:', aiResponse.tools.map(t => t.tool));
+          sendSSE({
+            type: 'intermittent',
+            message: aiResponse.message,
+            tools: aiResponse.tools.map(t => ({ name: t.tool, status: 'running' }))
+          });
+
+          // Execute tools
+          const toolResults = [];
+          for (const [index, toolRequest] of aiResponse.tools.entries()) {
+            try {
+              // Rate limiting
+              if (index > 0 && ['delete_event', 'create_event', 'update_event'].includes(toolRequest.tool)) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+              }
+
+              // Setup OAuth2 client
+              if (!userSession.tokens) {
+                toolResults.push({ success: false, message: 'Please reconnect your Google Calendar' });
+                continue;
+              }
+
+              const oauth2Client = new google.auth.OAuth2(
+                process.env.GOOGLE_CLIENT_ID,
+                process.env.GOOGLE_CLIENT_SECRET,
+                process.env.GOOGLE_REDIRECT_URI
+              );
+              oauth2Client.setCredentials(userSession.tokens);
+              await refreshTokenIfNeeded(sessionId, userSession);
+
+              // Execute tool
+              const toolResult = await processTool(toolRequest.tool, toolRequest.parameters, sessionId, oauth2Client);
+              toolResults.push(toolResult);
+
+            } catch (toolError) {
+              console.error('❌ [SSE] Tool error:', toolError);
+              toolResults.push({ success: false, message: `Failed to ${toolRequest.tool}: ${toolError.message}` });
+            }
+          }
+
+          currentMessage = `TOOL_RESULTS: ${JSON.stringify(toolResults, null, 2)}`;
+        }
+
+      } catch (processingError) {
+        console.error('❌ [SSE] Processing error:', processingError);
+        sendSSE({ type: 'final', message: 'Sorry, an error occurred during processing.' });
         res.end();
       }
-
-    } catch (parseError) {
-      // Not JSON - natural language response
-      console.log('💬 [SSE] Natural language response');
-      sendSSE({ type: 'final', message: aiResponse });
-
-      // Update conversation history
-      userSession.conversationHistory = [
-        ...userSession.conversationHistory,
-        { role: 'user', content: description, timestamp: new Date() },
-        { role: 'model', content: aiResponse, timestamp: new Date() }
-      ];
-      sessions.set(sessionId, userSession);
-      await saveSessions();
-
-      res.end();
-    }
+    }, 100);
 
   } catch (error) {
     console.error('❌ [SERVER] SSE error:', error);
     sendSSE({ type: 'error', message: '处理过程中出错，请稍后再试。' });
     res.end();
+  }
+});
+
+// Simplified tool confirmation - just execute and notify SSE
+app.post('/api/ai/confirm-tools', aiLimiter, requireAuth, async (req, res) => {
+  const { confirmed } = req.body;
+  const sessionId = req.headers['x-session-id'];
+  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+
+  console.log('🔄 [SERVER] Tool confirmation request:', {
+    requestId,
+    sessionId: sessionId.substring(0, 8) + '...',
+    confirmed,
+    ip: req.ip,
+    timestamp: new Date().toISOString()
+  });
+
+  try {
+    // Get pending confirmation context
+    const pendingContext = pendingConfirmations.get(sessionId);
+    if (!pendingContext) {
+      return res.status(404).json({ error: 'No pending confirmation found' });
+    }
+    if (pendingContext.cleanupTimeout) {
+      clearTimeout(pendingContext.cleanupTimeout);
+    }
+    pendingConfirmations.delete(sessionId);
+
+    const { res: sseRes, sendSSE, tools, currentConversationHistory, userSession } = pendingContext;
+
+    if (!confirmed) {
+      // User cancelled - notify SSE and let it handle with AI
+      console.log('❌ [SERVER] User cancelled tool execution');
+
+      // Add cancellation to conversation history
+      const updatedHistory = [
+        ...currentConversationHistory,
+        { role: 'user', content: 'User cancelled the requested operations.', timestamp: new Date() }
+      ];
+
+      // Continue SSE with cancellation - it will call AI to handle this
+      continueSSEAfterConfirmation(sessionId, updatedHistory, null, true);
+
+      return res.json({
+        success: true,
+        message: '',
+        cancelled: true
+      });
+    }
+
+    // User confirmed - execute tools
+    console.log('✅ [SERVER] User confirmed tool execution, proceeding...');
+
+    // Set up OAuth2 client for tool execution
+    if (!userSession.tokens) {
+      pendingConfirmations.delete(sessionId);
+      return res.status(401).json({ error: 'Please reconnect your Google Calendar' });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    oauth2Client.setCredentials(userSession.tokens);
+    await refreshTokenIfNeeded(sessionId, userSession);
+
+    // Execute tools with rate limiting
+    const toolResults = [];
+    for (const [index, toolRequest] of tools.entries()) {
+      try {
+        // Add delay between calendar operations
+        if (index > 0 && ['delete_event', 'create_event', 'update_event'].includes(toolRequest.tool)) {
+          const delay = 1000;
+          console.log(`⏳ [SERVER] Adding ${delay}ms delay between ${toolRequest.tool} operations (${index + 1}/${tools.length})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+
+        console.log(`🔧 [SERVER] Executing confirmed tool ${index + 1}/${tools.length}: ${toolRequest.tool}`);
+
+        // Use unified tool processing
+        const toolResult = await processTool(toolRequest.tool, toolRequest.parameters, sessionId, oauth2Client);
+        toolResults.push(toolResult);
+
+        console.log(`✅ [SERVER] Confirmed tool ${index + 1} completed:`, {
+          tool: toolRequest.tool,
+          success: toolResult.success,
+          message: toolResult.message?.substring(0, 50) + '...'
+        });
+      } catch (toolError) {
+        console.error(`❌ [SERVER] Confirmed tool ${index + 1} processing error:`, toolError);
+        toolResults.push({
+          success: false,
+          message: `Failed to ${toolRequest.tool}: ${toolError.message}`
+        });
+      }
+    }
+
+    // Add tool results to conversation history
+    const updatedHistory = [
+      ...currentConversationHistory,
+      { role: 'user', content: 'Confirm operations', timestamp: new Date() },
+      { role: 'user', content: `TOOL_RESULTS: ${JSON.stringify(toolResults, null, 2)}`, timestamp: new Date() }
+    ];
+
+    // Instead of sending a final message here, resume the SSE loop so the AI can summarize the tool results
+    continueSSEAfterConfirmation(sessionId, updatedHistory, toolResults, false);
+
+    // Respond to the HTTP request with a simple acknowledgement (the SSE will handle the user-facing message)
+    res.json({
+      success: true,
+      message: '',
+      toolResults: toolResults,
+      confirmed: true
+    });
+
+  } catch (error) {
+    console.error('❌ [SERVER] Tool confirmation error:', error);
+    // Clean up pending confirmation on error
+    pendingConfirmations.delete(sessionId);
+    res.status(500).json({
+      error: 'Failed to process tool confirmation',
+      details: error.message
+    });
   }
 });
 
@@ -2108,8 +2483,6 @@ app.post('/api/calendar/events', requireAuth, async (req, res) => {
     });
   }
 });
-
-
 
 // Track Pomodoro suggestion cooldowns to prevent spam
 const pomodoroCooldowns = new Map();
@@ -2324,21 +2697,13 @@ TIMING: Event #1 can overlap with Pomodoro. Events #2+ cannot overlap.
 
 Suggest optimal Pomodoro strategy:`;
 
-  // Log the prompt being sent to AI
-  console.log('🤖 [SERVER] AI Prompt sent:', {
-    requestId,
-    promptLength: prompt.length,
-    promptPreview: prompt.substring(0, 500) + (prompt.length > 500 ? '...' : ''),
-    isInitialized: !initializeSession,
-    model: GLOBAL_MODEL_CONFIG.getCurrentModel()
-  });
-
   try {
     const aiStartTime = Date.now();
     const modelResult = await callModel({
-      model: GLOBAL_MODEL_CONFIG.getCurrentModel(),
+      model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
       currentMessage: prompt,
       sessionId: sessionId,
+      requestId: requestId,
       options: {
         enableModelSwitching: true,
         enableCompaction: false // No conversation history for this call
@@ -2790,6 +3155,22 @@ async function findAvailableTimeSlots(constraints, oauth2Client) {
   }
 }
 
+// Debug endpoint to clear conversation history for the current session
+app.post('/api/debug/clear-history', requireAuth, async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  if (!sessionId || !sessions.has(sessionId)) {
+    return res.status(401).json({ success: false, error: 'No valid session found' });
+  }
+  const session = sessions.get(sessionId);
+  console.log('💾 [SERVER] Clearing conversation history for sessionId: ', sessionId,  'conversationHistory: ', session.conversationHistory);
+  session.conversationHistory = [];
+  session.preferredModel = GLOBAL_MODEL_CONFIG.primaryModel;
+  sessions.set(sessionId, session);
+  await saveSessions();
+  console.log('💾 [SERVER] Conversation history cleared');
+  res.json({ success: true, message: 'Conversation history cleared' });
+});
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Server error:', error);
@@ -2847,25 +3228,15 @@ async function callModel({
 
   // Get the model to use (session model or provided model)
   let currentModel = model;
-  if (sessionId && sessions.has(sessionId)) {
-    const session = sessions.get(sessionId);
-    currentModel = session.preferredModel || model;
+  if (sessionId) {
+    // Use getCurrentModel for consistency if sessionId is provided
+    currentModel = GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId);
   }
 
   // Ensure we have a valid model
   if (!currentModel) {
     currentModel = GLOBAL_MODEL_CONFIG.primaryModel;
   }
-
-  console.log('🤖 [SERVER] Unified model call:', {
-    requestedModel: model,
-    currentModel: currentModel,
-    sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-    conversationHistoryLength: conversationHistory?.length || 0,
-    currentMessageLength: currentMessage?.length || 0,
-    enableModelSwitching,
-    enableCompaction
-  });
 
   try {
     // Use the existing geminiGenerateContent function
@@ -2887,12 +3258,6 @@ async function callModel({
     };
 
   } catch (error) {
-    console.error('❌ [SERVER] Model call failed:', {
-      model: currentModel,
-      error: error.message,
-      status: error.response?.status,
-      enableModelSwitching
-    });
 
     // If model switching is disabled, throw the error
     if (!enableModelSwitching) {
@@ -2908,12 +3273,6 @@ async function callModel({
       console.error('❌ [SERVER] No fallback models available');
       throw error;
     }
-
-    console.log('🔄 [SERVER] Attempting model switch:', {
-      fromModel: currentModel,
-      availableFallbacks: availableFallbacks.slice(0, 3),
-      fallbackCount: availableFallbacks.length
-    });
 
     // Try each fallback model
     for (let i = 0; i < availableFallbacks.length; i++) {

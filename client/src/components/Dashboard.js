@@ -6,7 +6,8 @@ import {
   MessageCircle,
   Play,
   Pause,
-  RotateCcw
+  RotateCcw,
+  Trash2
 } from 'lucide-react';
 import { useCalendar } from '../context/CalendarContext';
 import { format, isToday, isTomorrow } from 'date-fns';
@@ -708,6 +709,9 @@ const Dashboard = () => {
   const handleSSERequest = (inputValue) => {
     return new Promise((resolve, reject) => {
       console.log('🚀 [DASHBOARD] Starting SSE request for:', inputValue);
+      
+      // Track if this SSE session used any tools
+      let usedToolsInThisSession = false;
 
       // Create EventSource for SSE
       const eventSource = new EventSource(`http://localhost:50001/api/ai/schedule-stream?${new URLSearchParams({
@@ -729,6 +733,13 @@ const Dashboard = () => {
           if (data.type === 'intermittent') {
             console.log('⚡ [DASHBOARD] Showing intermittent message:', data.message);
             console.log('🔧 [DASHBOARD] Tools running:', data.tools);
+            
+            // Track that this SSE session used tools
+            if (data.tools && data.tools.length > 0) {
+              usedToolsInThisSession = true;
+              console.log('🔧 [DASHBOARD] Marking SSE session as using tools');
+            }
+            
             // Add intermittent message immediately
             const messageId = Date.now();
             setChatMessages(prev => [...prev, {
@@ -738,6 +749,22 @@ const Dashboard = () => {
               isProcessing: true,
               tools: data.tools || []
             }]);
+
+          } else if (data.type === 'confirmation') {
+            console.log('⚠️ [DASHBOARD] Tools require confirmation:', data.tools);
+            // Add confirmation message with special UI
+            const messageId = Date.now();
+            setChatMessages(prev => [...prev, {
+              id: messageId,
+              type: 'ai',
+              content: data.message,
+              requiresConfirmation: true,
+              tools: data.tools,
+              isProcessing: false
+            }]);
+            eventSource.close();
+            setIsTyping(false);
+            resolve();
 
           } else if (data.type === 'final') {
             console.log('✅ [DASHBOARD] Showing final message:', data.message);
@@ -756,6 +783,23 @@ const Dashboard = () => {
                 tools: [] // No tools for final message
               }];
             });
+            
+            // Check if any tools were used in this SSE session (indicating events might have been created)
+            if (usedToolsInThisSession) {
+              console.log('🔄 [DASHBOARD] SSE session used tools, refreshing events...');
+              // Immediate refresh to catch newly created events quickly
+              setTimeout(() => {
+                console.log('📅 [DASHBOARD] Executing immediate post-SSE event refresh');
+                fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
+              }, 500);
+              
+              // Second refresh with longer delay to ensure Google Calendar has fully propagated changes
+              setTimeout(() => {
+                console.log('📅 [DASHBOARD] Executing delayed post-SSE event refresh');
+                fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
+              }, 3000);
+            }
+            
             eventSource.close();
             setIsTyping(false);
             resolve();
@@ -941,59 +985,167 @@ const Dashboard = () => {
     }
   };
 
-  const handleConfirmActions = async (tools, toolResults) => {
-    try {
-      await confirmAIAction(tools, toolResults);
 
-      // Update the existing message to show completion and revert to normal style
+
+  const handleConfirmActions = async (tools, messageId) => {
+    try {
+      console.log('✅ [DASHBOARD] User confirmed actions:', {
+        messageId,
+        toolCount: tools?.length || 0,
+        tools: tools?.map(t => t.tool)
+      });
+
+      // Update message to show processing
       setChatMessages(prev => prev.map(msg =>
-        msg.requiresConfirmation
+        msg.id === messageId
           ? {
             ...msg,
-            content: "All tools have been confirmed and executed successfully!",
-            isProcessing: false,
-            isCompleted: false,
-            requiresConfirmation: false,
-            tools: undefined,
-            toolResults: undefined
+            content: "⏳ Executing operations...",
+            isProcessing: true,
+            requiresConfirmation: false
           }
           : msg
       ));
-    } catch (error) {
-      console.error('❌ [DASHBOARD] Error confirming tools:', error);
 
-      // Update the existing message to show error and revert to normal style
+      // Call confirmation endpoint
+      const response = await fetch('/api/ai/confirm-tools', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-id': sessionId
+        },
+        body: JSON.stringify({
+          tools: tools,
+          confirmed: true,
+          originalMessage: inputMessage
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to confirm tools: ${response.status} ${response.statusText}`);
+      }
+
+      const result = await response.json();
+
+      console.log('✅ [DASHBOARD] Tool confirmation completed:', {
+        success: result.success,
+        messageLength: result.message?.length || 0
+      });
+
+      // Update message with final result
       setChatMessages(prev => prev.map(msg =>
-        msg.requiresConfirmation
+        msg.id === messageId
           ? {
             ...msg,
-            content: "❌ Failed to confirm tools. Please try again or contact support if the issue persists.",
+            content: result.message,
+            isProcessing: false,
+            isCompleted: true,
+            requiresConfirmation: false,
+            tools: undefined
+          }
+          : msg
+      ));
+
+      // Refresh events after successful operations
+      setTimeout(() => {
+        console.log('📅 [DASHBOARD] Refreshing events after confirmed operations');
+        fetchEvents(undefined, undefined, false);
+      }, 1000);
+
+    } catch (error) {
+      console.error('❌ [DASHBOARD] Error confirming actions:', error);
+
+      // Update message to show error
+      setChatMessages(prev => prev.map(msg =>
+        msg.id === messageId
+          ? {
+            ...msg,
+            content: `❌ Failed to execute operations: ${error.message}`,
             isProcessing: false,
             isCompleted: false,
             requiresConfirmation: false,
-            tools: undefined,
-            toolResults: undefined
+            tools: undefined
           }
           : msg
       ));
     }
   };
 
-  const handleCancelActions = () => {
-    // Update the existing message to show cancellation and revert to normal style
-    setChatMessages(prev => prev.map(msg =>
-      msg.requiresConfirmation
-        ? {
-          ...msg,
-          content: "❌ Tools have been cancelled. No changes were made to your calendar.",
-          isProcessing: false,
-          isCompleted: false,
-          requiresConfirmation: false,
-          tools: undefined,
-          toolResults: undefined
-        }
-        : msg
-    ));
+  const handleCancelActions = async (tools, messageId) => {
+    try {
+      console.log('❌ [DASHBOARD] User cancelled actions:', {
+        messageId,
+        toolCount: tools?.length || 0
+      });
+
+      // Update message to show processing cancellation
+      setChatMessages(prev => prev.map(msg =>
+        msg.id === messageId
+          ? {
+            ...msg,
+            content: "❌ Cancelling operations...",
+            isProcessing: true,
+            requiresConfirmation: false
+          }
+          : msg
+      ));
+
+      // Call confirmation endpoint with cancelled=false
+      const response = await fetch('/api/ai/confirm-tools', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-id': sessionId
+        },
+        body: JSON.stringify({
+          tools: tools,
+          confirmed: false,
+          originalMessage: inputMessage
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to cancel tools: ${response.status} ${response.statusText}`);
+      }
+
+      const result = await response.json();
+
+      console.log('✅ [DASHBOARD] Tool cancellation completed:', {
+        success: result.success,
+        cancelled: result.cancelled
+      });
+
+      // Update message with cancellation result
+      setChatMessages(prev => prev.map(msg =>
+        msg.id === messageId
+          ? {
+            ...msg,
+            content: result.message || "❌ Operations cancelled. No changes were made to your calendar.",
+            isProcessing: false,
+            isCompleted: false,
+            requiresConfirmation: false,
+            tools: undefined
+          }
+          : msg
+      ));
+
+    } catch (error) {
+      console.error('❌ [DASHBOARD] Error cancelling actions:', error);
+
+      // Update message to show error
+      setChatMessages(prev => prev.map(msg =>
+        msg.id === messageId
+          ? {
+            ...msg,
+            content: "❌ Error processing cancellation. Operations were not executed.",
+            isProcessing: false,
+            isCompleted: false,
+            requiresConfirmation: false,
+            tools: undefined
+          }
+          : msg
+      ));
+    }
   };
 
   const createEventFromSuggestion = async (suggestion) => {
@@ -1168,6 +1320,42 @@ const Dashboard = () => {
   };
 
   const upcomingEvents = getUpcomingEvents();
+
+  // Dropdown state for tools
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const toolsRef = useRef(null);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (toolsRef.current && !toolsRef.current.contains(event.target)) {
+        setToolsOpen(false);
+      }
+    }
+    if (toolsOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    } else {
+      document.removeEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [toolsOpen]);
+
+  // Add a debug function to clear chat history (client + server)
+  const handleClearChatHistory = async () => {
+    if (!window.confirm('Are you sure you want to clear the entire conversation history? This cannot be undone.')) return;
+    setChatMessages([]);
+    if (sessionId) {
+      try {
+        await fetch('/api/debug/clear-history', {
+          method: 'POST',
+          headers: { 'x-session-id': sessionId }
+        });
+      } catch (err) {
+        // Optionally show error to user
+        console.error('Failed to clear server conversation history:', err);
+      }
+    }
+  };
 
   return (
     <div className="h-screen flex flex-col overflow-hidden p-2">
@@ -1424,14 +1612,7 @@ const Dashboard = () => {
                     className={`flex flex-col ${message.type === 'user' ? 'items-end' : 'items-start'} mb-4`}
                   >
                     <div
-                      className={`max-w-[80%] ${message.type === 'user'
-                        ? 'bg-gray-200 text-gray-800 rounded-2xl px-4 py-3 ml-auto'
-                        : message.isCompleted
-                          ? 'bg-green-50 border border-green-200 rounded-2xl px-4 py-3'
-                          : message.requiresConfirmation
-                            ? 'bg-yellow-50 border border-yellow-200 rounded-2xl px-4 py-3'
-                            : 'bg-white border border-gray-100 rounded-2xl px-4 py-3'
-                        }`}
+                      className={`max-w-[80%] ${message.type === 'user' ? 'bg-gray-200 text-gray-800 rounded-2xl px-4 py-3 ml-auto' : message.isCompleted ? 'bg-green-50 border border-green-200 rounded-2xl px-4 py-3' : message.requiresConfirmation ? 'bg-yellow-50 border border-yellow-200 rounded-2xl px-4 py-3' : 'bg-white border border-gray-100 rounded-2xl px-4 py-3'}`}
                     >
 
                       {/* Status indicator */}
@@ -1559,32 +1740,40 @@ const Dashboard = () => {
 
                       {/* Tool confirmation buttons */}
                       {(() => {
-                        const shouldShowConfirmation = message.requiresConfirmation && message.tools && message.toolResults;
+                        const shouldShowConfirmation = message.requiresConfirmation && message.tools;
                         console.log('🔍 [DASHBOARD] Checking confirmation UI:', {
                           messageId: message.id,
                           requiresConfirmation: message.requiresConfirmation,
                           hasTools: !!message.tools,
-                          hasToolResults: !!message.toolResults,
                           shouldShowConfirmation,
                           toolsCount: message.tools?.length || 0,
-                          toolResultsCount: message.toolResults?.length || 0
+                          tools: message.tools?.map(t => t.tool)
                         });
 
                         return shouldShowConfirmation ? (
                           <div className="mt-3 space-y-2">
-                            <div className="text-xs text-gray-500 mb-2">Please confirm these tools:</div>
+                            <div className="text-xs text-gray-500 mb-2">
+                              Please confirm these operations:
+                              <div className="mt-1">
+                                {message.tools.map((tool, idx) => (
+                                  <div key={idx} className="text-xs text-gray-600">
+                                    • {tool.tool === 'delete_event' ? `Delete "${tool.parameters.eventTitle}"` : tool.tool}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
                             <div className="flex flex-wrap gap-2">
                               <button
-                                onClick={() => handleConfirmActions(message.tools, message.toolResults)}
-                                className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
+                                onClick={() => handleConfirmActions(message.tools, message.id)}
+                                className="px-3 py-1 bg-red-100 text-red-700 rounded-lg text-xs hover:bg-red-200 transition-colors font-normal"
                               >
-                                Confirm All
+                                ✅ Confirm All
                               </button>
                               <button
-                                onClick={() => handleCancelActions()}
+                                onClick={() => handleCancelActions(message.tools, message.id)}
                                 className="px-3 py-1 bg-gray-100 text-gray-700 rounded-lg text-xs hover:bg-gray-200 transition-colors font-normal"
                               >
-                                Cancel All
+                                ❌ Cancel
                               </button>
                             </div>
                           </div>
@@ -1697,17 +1886,47 @@ const Dashboard = () => {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
                       </svg>
                     </button>
-                    <button
-                      type="button"
-                      className="flex items-center space-x-1 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors px-1 py-1"
-                      title="Tools"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      </svg>
-                      <span className="text-sm">Tools</span>
-                    </button>
+                    <div className="relative" ref={toolsRef}>
+                      <button
+                        type="button"
+                        className="flex items-center space-x-1 text-gray-600 hover:text-gray-700 hover:bg-gray-50 rounded-lg transition-colors px-1 py-1"
+                        title="Tools"
+                        onClick={() => setToolsOpen((open) => !open)}
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                        </svg>
+                        <span className="text-sm">Tools</span>
+                        <svg className="w-3 h-3 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                        </svg>
+                      </button>
+                      {toolsOpen && (
+                        <div className="absolute left-0 bottom-10 mb-2 w-48 bg-white rounded-xl shadow-xl z-50 py-1 animate-fade-in border border-gray-100" style={{ bottom: '100%' }}>
+                          <div className="flex flex-col divide-y divide-gray-100">
+                            <button
+                              type="button"
+                              className="flex items-center gap-2 px-4 py-2 text-sm text-red-600 hover:bg-red-50 hover:text-red-800 transition-colors rounded-none text-left"
+                              onClick={() => { handleClearChatHistory(); setToolsOpen(false); }}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                              <span>Clear History</span>
+                            </button>
+                            {/* Example for future tools:
+                            <button
+                              type="button"
+                              className="flex items-center gap-3 px-5 py-3 text-base text-gray-700 hover:bg-gray-50 transition-colors rounded-none text-left"
+                              onClick={() => {}}
+                            >
+                              <SomeIcon className="w-5 h-5" />
+                              <span>Some Tool</span>
+                            </button>
+                            */}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   <button
