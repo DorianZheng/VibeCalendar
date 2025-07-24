@@ -709,7 +709,7 @@ const Dashboard = () => {
   const handleSSERequest = (inputValue) => {
     return new Promise((resolve, reject) => {
       console.log('🚀 [DASHBOARD] Starting SSE request for:', inputValue);
-      
+
       // Track if this SSE session used any tools
       let usedToolsInThisSession = false;
 
@@ -733,13 +733,13 @@ const Dashboard = () => {
           if (data.type === 'intermittent') {
             console.log('⚡ [DASHBOARD] Showing intermittent message:', data.message);
             console.log('🔧 [DASHBOARD] Tools running:', data.tools);
-            
+
             // Track that this SSE session used tools
             if (data.tools && data.tools.length > 0) {
               usedToolsInThisSession = true;
               console.log('🔧 [DASHBOARD] Marking SSE session as using tools');
             }
-            
+
             // Add intermittent message immediately
             const messageId = Date.now();
             setChatMessages(prev => [...prev, {
@@ -783,7 +783,7 @@ const Dashboard = () => {
                 tools: [] // No tools for final message
               }];
             });
-            
+
             // Check if any tools were used in this SSE session (indicating events might have been created)
             if (usedToolsInThisSession) {
               console.log('🔄 [DASHBOARD] SSE session used tools, refreshing events...');
@@ -792,14 +792,14 @@ const Dashboard = () => {
                 console.log('📅 [DASHBOARD] Executing immediate post-SSE event refresh');
                 fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
               }, 500);
-              
+
               // Second refresh with longer delay to ensure Google Calendar has fully propagated changes
               setTimeout(() => {
                 console.log('📅 [DASHBOARD] Executing delayed post-SSE event refresh');
                 fetchEvents(undefined, undefined, false); // Background refresh, no loading indicator
               }, 3000);
             }
-            
+
             eventSource.close();
             setIsTyping(false);
             resolve();

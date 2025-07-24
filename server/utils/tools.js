@@ -4,7 +4,7 @@ const { google } = require('googleapis');
 const calendarRateLimiter = new Map(); // sessionId -> lastOperationTime
 
 // Helper function to enforce rate limiting for calendar operations
-const enforceCalendarRateLimit = async (sessionId, operationType = 'calendar') => {
+const enforceCalendarRateLimit = async (sessionId) => {
   const now = Date.now();
   const lastOperation = calendarRateLimiter.get(sessionId);
   const minInterval = 1000; // 1 second minimum between operations

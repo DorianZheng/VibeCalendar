@@ -1,108 +1,20 @@
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const dotenv = require('dotenv');
-const { google } = require('googleapis');
-const axios = require('axios');
-const HttpsProxyAgent = require('https-proxy-agent');
-const fs = require('fs').promises;
-const path = require('path');
-const requestLogger = require('./middleware/requestLogger');
-const { logExternalError, generateExternalRequestId } = require('./utils/externalApiLogger');
-const { toolHandlers } = require('./utils/tools');
-const { generateGlobalSystemPrompt } = require('./utils/systemPrompt');
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
+import { google } from 'googleapis';
+import path from 'path';
+import requestLogger from './middleware/requestLogger.js';
+import { toolHandlers, enforceCalendarRateLimit } from './utils/tools.js';
+import { generateGlobalSystemPrompt } from './utils/systemPrompt.js';
+import { geminiGenerateContent, getModelStatus } from './utils/gemini.js';
+import { compactConversationHistory } from './utils/conversationUtils.js';
+import { parseAiResponse, processTool } from './utils/aiUtils.js';
+import { saveSessions, cleanupExpiredSessions, initSessions, refreshTokenIfNeeded, getCurrentModel } from './utils/session.js';
 
 // Load environment variables
 dotenv.config();
-
-// Global model configuration - single source of truth for all model selections
-const GLOBAL_MODEL_CONFIG = {
-  // Primary model to use for all AI operations (using faster model for better performance)
-  // primaryModel: 'gemini-2.5-flash',
-  primaryModel: 'gemini-2.5-pro',
-
-  // Fallback models in order of preference (prioritizing faster models)
-  fallbackModels: [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite',
-    'gemini-2.0-flash-001',
-    'gemini-2.0-flash-lite-001',
-  ],
-
-  // Get the current model to use (can be overridden by session preferences)
-  getCurrentModel: (sessionId = null) => {
-    if (sessionId && sessions.has(sessionId)) {
-      const session = sessions.get(sessionId);
-      return session.preferredModel || GLOBAL_MODEL_CONFIG.primaryModel;
-    }
-    return GLOBAL_MODEL_CONFIG.primaryModel;
-  },
-
-  // Update configuration based on available models from API
-  updateFromAvailableModels: (availableModels) => {
-    if (!availableModels || availableModels.length === 0) {
-      console.log('⚠️ [SERVER] No available models provided, keeping current configuration');
-      return;
-    }
-
-    // Extract model names (remove 'models/' prefix)
-    const modelNames = availableModels.map(m => m.name.replace('models/', ''));
-
-    // Update fallback models to only include available ones
-    const availableFallbacks = GLOBAL_MODEL_CONFIG.fallbackModels.filter(model =>
-      modelNames.includes(model)
-    );
-
-    // If primary model is not available, use first available model
-    let newPrimaryModel = GLOBAL_MODEL_CONFIG.primaryModel;
-    if (!modelNames.includes(GLOBAL_MODEL_CONFIG.primaryModel)) {
-      newPrimaryModel = modelNames[0];
-      console.log(`⚠️ [SERVER] Primary model ${GLOBAL_MODEL_CONFIG.primaryModel} not available, switching to ${newPrimaryModel}`);
-    }
-
-    // Update configuration
-    GLOBAL_MODEL_CONFIG.primaryModel = newPrimaryModel;
-    GLOBAL_MODEL_CONFIG.fallbackModels = availableFallbacks;
-
-    console.log(`✅ [SERVER] Updated global model configuration:`);
-    console.log(`   Primary model: ${GLOBAL_MODEL_CONFIG.primaryModel}`);
-    console.log(`   Available fallbacks: ${GLOBAL_MODEL_CONFIG.fallbackModels.length} models`);
-
-    // Note: Session models will be updated reactively when API calls fail
-  },
-
-  // Session models are now updated reactively in geminiGenerateContent error handler
-
-  // Force update all sessions to use current global model (for admin use)
-  forceUpdateAllSessions: () => {
-    let updatedSessions = 0;
-
-    for (const [sessionId, session] of sessions.entries()) {
-      if (session.preferredModel !== GLOBAL_MODEL_CONFIG.primaryModel) {
-        const oldModel = session.preferredModel;
-        session.preferredModel = GLOBAL_MODEL_CONFIG.primaryModel;
-        updatedSessions++;
-
-        console.log(`🔄 [SERVER] Force updated session ${sessionId.substring(0, 8)}... model: ${oldModel} → ${session.preferredModel}`);
-      }
-    }
-
-    if (updatedSessions > 0) {
-      console.log(`✅ [SERVER] Force updated ${updatedSessions} sessions to use current global model`);
-      // Save sessions to persist the changes
-      saveSessions().catch(err => {
-        console.error('❌ [SERVER] Failed to save updated sessions:', err.message);
-      });
-    }
-
-    return updatedSessions;
-  }
-};
-
-// Global rate limiting for calendar operations
-const calendarRateLimiter = new Map(); // sessionId -> lastOperationTime
 
 // Track pending confirmations and their SSE connections
 const pendingConfirmations = new Map(); // sessionId -> { res, sendSSE, tools, aiResponse, currentConversationHistory }
@@ -118,6 +30,8 @@ async function continueSSEAfterConfirmation(sessionId, updatedConversationHistor
   const { res, sendSSE, userSession } = pendingContext;
 
   try {
+    const systemPrompt = generateGlobalSystemPrompt(userTimezone, toolHandlers);
+
     // Update user session with new conversation history
     userSession.conversationHistory = updatedConversationHistory;
     sessions.set(sessionId, userSession);
@@ -126,9 +40,7 @@ async function continueSSEAfterConfirmation(sessionId, updatedConversationHistor
     if (wasCancelled) {
       // Handle cancellation with AI
       const userTimezone = userSession.timezone || 'UTC';
-      const cancellationSystemPrompt = generateGlobalSystemPrompt(userTimezone);
       const cancellationResponse = await callModel({
-        model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
         conversationHistory: updatedConversationHistory,
         currentMessage: '',
         systemPrompt: cancellationSystemPrompt,
@@ -154,12 +66,11 @@ async function continueSSEAfterConfirmation(sessionId, updatedConversationHistor
 
     // Handle successful tool execution with AI summary
     const userTimezone = userSession.timezone || 'UTC';
-    const summarySystemPrompt = generateGlobalSystemPrompt(userTimezone);
+    const summarySystemPrompt = generateGlobalSystemPrompt(userTimezone, toolHandlers);
     const finalResponse = await callModel({
-      model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
       conversationHistory: updatedConversationHistory,
       currentMessage: '',
-      systemPrompt: summarySystemPrompt,
+      systemPrompt,
       sessionId: sessionId
     });
 
@@ -185,101 +96,6 @@ async function continueSSEAfterConfirmation(sessionId, updatedConversationHistor
   }
 }
 
-
-
-// Parse AI response and extract tools if any
-function parseAiResponse(aiResponseText) {
-  try {
-    let cleanResponse = aiResponseText.trim();
-
-    // Look for JSON in code blocks first
-    const jsonMatch = cleanResponse.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```$/);
-    if (jsonMatch) {
-      cleanResponse = jsonMatch[1];
-    } else {
-      // Only look for JSON if it looks like a tool calling response
-      // (starts with { and contains "tools" array)
-      const startsWithBrace = cleanResponse.startsWith('{');
-      const endsWithBrace = cleanResponse.endsWith('}');
-      const containsTools = cleanResponse.includes('"tools"');
-
-      if (startsWithBrace && endsWithBrace && containsTools) {
-        // This might be a tool calling response
-        const lastBraceIndex = cleanResponse.lastIndexOf('}');
-        if (lastBraceIndex !== -1) {
-          const firstBraceIndex = cleanResponse.indexOf('{');
-          if (firstBraceIndex !== -1 && firstBraceIndex < lastBraceIndex) {
-            cleanResponse = cleanResponse.substring(firstBraceIndex, lastBraceIndex + 1);
-          }
-        }
-      } else {
-        // This is plain text, not a tool calling response
-        return {
-          tools: [],
-          message: aiResponseText,
-          isJson: false
-        };
-      }
-    }
-
-    const parsed = JSON.parse(cleanResponse);
-
-    // Only treat as valid tool response if it has tools array
-    if (parsed.tools && Array.isArray(parsed.tools)) {
-      return {
-        tools: parsed.tools || [],
-        message: parsed.message || aiResponseText,
-        isJson: true
-      };
-    } else {
-      // Not a valid tool response, treat as plain text
-      return {
-        tools: [],
-        message: aiResponseText,
-        isJson: false
-      };
-    }
-  } catch (parseError) {
-    return {
-      tools: [],
-      message: aiResponseText,
-      isJson: false
-    };
-  }
-}
-
-// Generic tool processor
-const processTool = async (tool, parameters, sessionId, oauth2Client) => {
-  const toolConfig = toolHandlers[tool];
-
-  if (!toolConfig) {
-    // This should not happen since the AI knows what tools are available
-    console.error(`❌ [SERVER] Unknown tool requested: ${tool}`);
-    return {
-      success: false,
-      message: `Unknown tool: ${tool}`,
-      requiresConfirmation: false
-    };
-  }
-
-  try {
-    const result = await toolConfig.handler(parameters, sessionId, oauth2Client);
-
-    // Ensure requiresConfirmation is set from tool config
-    return {
-      ...result,
-      requiresConfirmation: toolConfig.requiresConfirmation || false
-    };
-  } catch (error) {
-    console.error(`❌ [SERVER] Tool ${tool} failed:`, error);
-    return {
-      success: false,
-      message: `Failed to ${tool}: ${error.message}`,
-      requiresConfirmation: false
-    };
-  }
-};
-
 const app = express();
 const PORT = process.env.PORT || 50001;
 
@@ -289,135 +105,41 @@ app.set('trust proxy', 1);
 // Add request logging middleware
 app.use(requestLogger);
 
-// Configure proxy settings for external API calls
-const proxyConfig = {
-  http: process.env.HTTP_PROXY || process.env.http_proxy,
-  https: process.env.HTTPS_PROXY || process.env.https_proxy,
-  no_proxy: process.env.NO_PROXY || process.env.no_proxy
-};
-
-// Log proxy configuration
-if (proxyConfig.http || proxyConfig.https) {
-  console.log('🌐 [SERVER] Proxy configuration detected:', {
-    http: proxyConfig.http ? 'configured' : 'none',
-    https: proxyConfig.https ? 'configured' : 'none',
-    no_proxy: proxyConfig.no_proxy || 'none'
-  });
-} else {
-  console.log('🌐 [SERVER] No proxy configuration found');
-}
-
 // Persistent session store
-const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
-const sessions = new Map();
-
-// Load sessions from file on startup
-const loadSessions = async () => {
-  try {
-    const data = await fs.readFile(SESSIONS_FILE, 'utf8');
-    const sessionsData = JSON.parse(data);
-
-    // Convert back to Map and validate tokens
-    for (const [sessionId, sessionData] of Object.entries(sessionsData)) {
-      // Check if tokens are still valid (not expired)
-      if (sessionData.tokens && sessionData.tokens.expiry_date && sessionData.tokens.expiry_date > Date.now()) {
-        sessions.set(sessionId, sessionData);
-        console.log('✅ [SERVER] Loaded session:', sessionId.substring(0, 8) + '...');
-      } else {
-        console.log('⚠️ [SERVER] Skipped expired session:', sessionId.substring(0, 8) + '...');
-      }
-    }
-
-    console.log(`📁 [SERVER] Loaded ${sessions.size} valid sessions from storage`);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      console.log('📁 [SERVER] No existing sessions file found, starting fresh');
-    } else {
-      console.error('❌ [SERVER] Error loading sessions:', error.message);
-    }
-  }
-};
-
-// Save sessions to file
-const saveSessions = async () => {
-  try {
-    const sessionsData = {};
-    for (const [sessionId, sessionData] of sessions.entries()) {
-      sessionsData[sessionId] = sessionData;
-    }
-
-    await fs.writeFile(SESSIONS_FILE, JSON.stringify(sessionsData, null, 2));
-    console.log(`💾 [SERVER] Saved ${sessions.size} sessions to storage`);
-  } catch (error) {
-    console.error('❌ [SERVER] Error saving sessions:', error.message);
-  }
-};
-
-// Initialize sessions on startup
-loadSessions();
-
-// Token refresh function
-const refreshTokenIfNeeded = async (sessionId, session) => {
-  try {
-    if (session.tokens.expiry_date && session.tokens.expiry_date <= Date.now() + 5 * 60 * 1000) { // 5 minutes before expiry
-      console.log('🔄 [SERVER] Refreshing token for session:', sessionId.substring(0, 8) + '...');
-
-      oauth2Client.setCredentials(session.tokens);
-      const { credentials } = await oauth2Client.refreshAccessToken();
-
-      session.tokens = credentials;
-      sessions.set(sessionId, session);
-      await saveSessions();
-
-      console.log('✅ [SERVER] Token refreshed for session:', sessionId.substring(0, 8) + '...');
-    }
-  } catch (error) {
-    console.error('❌ [SERVER] Token refresh failed for session:', sessionId.substring(0, 8) + '...', error.message);
-    // Remove the session if refresh fails
-    sessions.delete(sessionId);
-    await saveSessions();
-  }
-};
-
-// Cleanup expired sessions
-const cleanupExpiredSessions = async () => {
-  const now = Date.now();
-  let cleanedCount = 0;
-
-  for (const [sessionId, session] of sessions.entries()) {
-    if (session.tokens.expiry_date && session.tokens.expiry_date < now) {
-      sessions.delete(sessionId);
-      cleanedCount++;
-    }
-  }
-
-  if (cleanedCount > 0) {
-    await saveSessions();
-    console.log(`🧹 [SERVER] Cleaned up ${cleanedCount} expired sessions`);
-  }
-};
-
+// Use process.env.SESSIONS_PATH for the sessions file path
+// Make sure to set SESSIONS_PATH in your environment or .env file, e.g. SESSIONS_PATH=./server/sessions.json
+const sessionsFilePath = process.env.SESSIONS_PATH;
+const sessions = await initSessions(sessionsFilePath);
 // Run cleanup every hour
 setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
 
-// Graceful shutdown handler
+function registerGracefulShutdown(server) {
 process.on('SIGINT', async () => {
   console.log('🛑 [SERVER] Shutting down gracefully...');
   await saveSessions();
+    if (server && server.close) {
   server.close(() => {
     console.log('✅ [SERVER] Server closed');
     process.exit(0);
   });
+    } else {
+      process.exit(0);
+    }
 });
 
 process.on('SIGTERM', async () => {
   console.log('🛑 [SERVER] Shutting down gracefully...');
   await saveSessions();
+    if (server && server.close) {
   server.close(() => {
     console.log('✅ [SERVER] Server closed');
     process.exit(0);
   });
+    } else {
+      process.exit(0);
+    }
 });
+}
 
 // Middleware
 app.use(helmet());
@@ -452,476 +174,6 @@ app.use(generalLimiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const geminiProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const geminiAgent = geminiProxy ? new (HttpsProxyAgent.HttpsProxyAgent || HttpsProxyAgent)(geminiProxy) : undefined;
-
-async function geminiGenerateContent({ model, conversationHistory = [], currentMessage, systemPrompt = null, retryCount = 0, fallbackAttempt = 0, sessionId = null, requestId = null }) {
-  const maxRetries = 3;
-  const baseDelay = 1000; // 1 second
-  const startTime = Date.now();
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`;
-
-  // Build conversation contents
-  const contents = [
-    // Add system prompt if provided
-    ...(systemPrompt ? [{
-      role: 'user',
-      parts: [{ text: systemPrompt }]
-    }] : []),
-    // Add conversation history
-    ...(conversationHistory || []).map(msg => ({
-      role: msg.role, // Gemini API supports 'user' and 'model' roles directly
-      parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }]
-    })),
-    // Add current message
-    {
-      role: 'user',
-      parts: [{ text: currentMessage || '' }]
-    }
-  ];
-
-  const body = { contents };
-  const options = {
-    headers: { 'Content-Type': 'application/json' },
-    timeout: fallbackAttempt > 0 ? 20000 : 30000 // 30s for primary, 20s for fallbacks
-  };
-  if (geminiAgent) options.httpsAgent = geminiAgent;
-
-  // Log detailed request information (compact version)
-  // Always show system prompt + last 4 entries to preserve system prompt visibility
-  let recentContents;
-  let hasMoreContents = false;
-  
-  if (contents.length <= 5) {
-    // Show all contents if 5 or fewer
-    recentContents = contents;
-  } else {
-    // Show system prompt (first entry) + last 4 entries
-    const systemPromptEntry = contents[0];
-    const lastFourEntries = contents.slice(-4);
-    recentContents = [systemPromptEntry, ...lastFourEntries];
-    hasMoreContents = contents.length > 5;
-  }
-
-  console.log('🤖 [GEMINI REQUEST]:', {
-    requestId,
-    model,
-    sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-    url: url.replace(geminiApiKey, '***API_KEY***'),
-    timeout: options.timeout,
-    hasProxy: !!geminiAgent,
-    retryCount,
-    fallbackAttempt,
-    requestBody: {
-      contentsCount: contents.length,
-      systemPromptLength: systemPrompt?.length || 0,
-      conversationHistoryLength: conversationHistory?.length || 0,
-      currentMessageLength: currentMessage?.length || 0,
-      totalInputTokensEstimate: JSON.stringify(body).length
-    },
-    contentsSummary: recentContents.map((content, summaryIndex) => {
-      // Find the actual index of this content in the original contents array
-      let actualIndex;
-      if (contents.length <= 5) {
-        actualIndex = summaryIndex;
-      } else {
-        // First entry is system prompt (index 0), rest are from the end
-        if (summaryIndex === 0) {
-          actualIndex = 0; // System prompt
-        } else {
-          actualIndex = contents.length - 4 + (summaryIndex - 1); // Last 4 entries
-        }
-      }
-      
-      return {
-        index: actualIndex,
-        role: content.role,
-        textLength: content.parts[0]?.text?.length || 0,
-        textPreview: content.parts[0]?.text?.substring(0, 200) + (content.parts[0]?.text?.length > 200 ? '...' : ''),
-        ...(hasMoreContents && summaryIndex === 1 ? { 
-          note: `... ${contents.length - 5} entries omitted between system prompt and recent messages ...` 
-        } : {})
-      };
-    }),
-    timestamp: new Date().toISOString()
-  });
-
-  try {
-    const response = await axios.post(url, body, options);
-    const endTime = Date.now();
-    const responseTime = endTime - startTime;
-
-    // Log detailed response information
-    console.log('✅ [GEMINI RESPONSE]:', {
-      requestId,
-      model,
-      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-      status: response.status,
-      responseTime: `${responseTime}ms`,
-      responseText: response.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No text content',
-      responseData: {
-        candidates: response.data.candidates?.map((candidate, index) => ({
-          index,
-          finishReason: candidate.finishReason,
-          contentLength: candidate.content?.parts?.[0]?.text?.length || 0,
-          contentPreview: candidate.content?.parts?.[0]?.text?.substring(0, 200) + (candidate.content?.parts?.[0]?.text?.length > 200 ? '...' : ''),
-          fullText: candidate.content?.parts?.[0]?.text || 'No text',
-          safetyRatings: candidate.safetyRatings?.map(rating => ({
-            category: rating.category,
-            probability: rating.probability
-          }))
-        })),
-        usageMetadata: response.data.usageMetadata,
-        promptFeedback: response.data.promptFeedback
-      },
-      timestamp: new Date().toISOString()
-    });
-
-    // Mark model as available on success
-    if (modelStatus[model]) {
-      modelStatus[model].available = true;
-      modelStatus[model].lastError = null;
-    }
-
-    return response.data;
-  } catch (error) {
-    const endTime = Date.now();
-    const responseTime = endTime - startTime;
-
-    // Log external API error
-    console.error('❌ [GEMINI ERROR]:', {
-      requestId,
-      model,
-      sessionId: sessionId ? sessionId.substring(0, 8) + '...' : 'none',
-      error: error.message,
-      status: error.response?.status,
-      statusText: error.response?.statusText,
-      responseTime: `${responseTime}ms`,
-      retryCount,
-      fallbackAttempt,
-      requestUrl: url.replace(geminiApiKey, '***API_KEY***'),
-      requestBody: {
-        contentsCount: contents.length,
-        systemPromptLength: systemPrompt?.length || 0,
-        conversationHistoryLength: conversationHistory?.length || 0,
-        currentMessageLength: currentMessage?.length || 0,
-        totalInputTokensEstimate: JSON.stringify(body).length
-      },
-      responseData: error.response?.data,
-      hasProxy: !!geminiAgent,
-      timestamp: new Date().toISOString()
-    });
-
-    // Model fallback configuration - using global config
-    const modelFallbacks = {};
-
-    // Create fallback mappings for all models using the global fallback list
-    const allModels = [GLOBAL_MODEL_CONFIG.primaryModel, ...GLOBAL_MODEL_CONFIG.fallbackModels];
-    allModels.forEach((currentModel, index) => {
-      // Get remaining models as fallbacks
-      const fallbacks = GLOBAL_MODEL_CONFIG.fallbackModels.slice(index);
-      modelFallbacks[currentModel] = fallbacks;
-    });
-
-    console.log(`🔍 [SERVER] Model fallback configuration for ${model}:`, {
-      model: model,
-      fallbacks: modelFallbacks[model] || [],
-      fallbackCount: (modelFallbacks[model] || []).length
-    });
-
-    // For 503 errors (service overload), switch to fallback models immediately instead of retrying
-    if (error.response?.status === 503) {
-      const fallbacks = modelFallbacks[model] || [];
-      
-      console.log(`🔄 [SERVER] Model ${model} is overloaded (503), switching to fallback models instead of retrying`);
-      
-      if (fallbackAttempt < fallbacks.length) {
-        const nextModel = fallbacks[fallbackAttempt];
-        console.log(`🔄 [SERVER] Switching from overloaded ${model} to fallback model: ${nextModel} (attempt ${fallbackAttempt + 1}/${fallbacks.length})`);
-        
-        // Update session's preferred model if sessionId is provided
-        if (sessionId && sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          session.preferredModel = nextModel;
-          sessions.set(sessionId, session);
-          await saveSessions();
-          console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${nextModel} due to 503 overload`);
-        }
-        
-        // Try with the next fallback model
-        return geminiGenerateContent({
-          model: nextModel,
-          currentMessage,
-          conversationHistory,
-          systemPrompt, // Preserve system prompt
-          retryCount: 0,
-          fallbackAttempt: fallbackAttempt + 1,
-          sessionId,
-          requestId
-        });
-      } else {
-        console.error(`❌ [SERVER] All fallback models exhausted for overloaded ${model}. No more models available.`);
-      }
-    }
-
-    // Retry logic for other server errors (but preserve system prompt)
-    if ((error.response?.status >= 500 || error.code === 'ECONNRESET') && retryCount < maxRetries) {
-      const delay = baseDelay * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
-      console.log(`🔄 [SERVER] Server error ${error.response?.status || error.code}, retrying with same model ${model} in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
-
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return geminiGenerateContent({ 
-        model, 
-        currentMessage, 
-        conversationHistory, 
-        systemPrompt, // Preserve system prompt
-        retryCount: retryCount + 1, 
-        fallbackAttempt,
-        sessionId, 
-        requestId 
-      });
-    }
-
-    // Handle timeout errors by switching to faster models
-    if (error.code === 'ECONNABORTED' && error.message.includes('timeout')) {
-      const fallbacks = modelFallbacks[model] || [];
-
-      console.log(`⏰ [SERVER] Timeout detected for model ${model}, attempting to switch to faster model`);
-      console.log(`🔍 [SERVER] Timeout fallback configuration:`, {
-        model: model,
-        fallbacksAvailable: fallbacks.length,
-        fallbacks: fallbacks.slice(0, 3) // Show first 3 fallbacks
-      });
-
-      if (fallbackAttempt < fallbacks.length) {
-        const nextModel = fallbacks[fallbackAttempt];
-        console.log(`🔄 [SERVER] Switching from ${model} to faster model: ${nextModel} due to timeout (attempt ${fallbackAttempt + 1}/${fallbacks.length})`);
-        console.log(`📝 [SERVER] Preserving conversation context: ${conversationHistory?.length || 0} messages`);
-
-        // Update session's preferred model if sessionId is provided
-        if (sessionId && sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          if (session.preferredModel === model) {
-            session.preferredModel = nextModel;
-            sessions.set(sessionId, session);
-            await saveSessions();
-            console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${nextModel} due to timeout`);
-          }
-        }
-
-        // Try with the next fallback model, using intelligent conversation history compaction
-        const optimizedHistory = await compactConversationHistory(conversationHistory, {
-          maxMessages: 6,
-          maxTotalLength: 4000, // More aggressive for timeout recovery
-          preserveSystemMessage: true,
-          preserveRecentMessages: 4
-        });
-
-        return geminiGenerateContent({
-          model: nextModel,
-          currentMessage,
-          conversationHistory: optimizedHistory,
-          systemPrompt, // Preserve system prompt
-          retryCount: 0,
-          fallbackAttempt: fallbackAttempt + 1,
-          sessionId,
-          requestId
-        });
-      } else {
-        console.error(`❌ [SERVER] All fallback models exhausted for timeout recovery. No more models available.`);
-      }
-    }
-
-    // Update model status on error
-    if (modelStatus[model]) {
-      modelStatus[model].lastError = {
-        status: error.response?.status,
-        message: error.message,
-        timestamp: new Date().toISOString()
-      };
-      modelStatus[model].errorCount++;
-
-      // Mark model as temporarily unavailable if it hits rate limits
-      if (error.response?.status === 429) {
-        modelStatus[model].available = false;
-        console.log(`⚠️ [SERVER] Model ${model} marked as temporarily unavailable due to rate limit`);
-      }
-    }
-
-    // Update session's preferred model if the current model is not available (404, 403, etc.)
-    if (sessionId && sessions.has(sessionId)) {
-      const session = sessions.get(sessionId);
-      const isModelAvailabilityError = (
-        error.response?.status === 404 ||
-        error.response?.status === 403 ||
-        (error.response?.data?.error?.message && error.response.data.error.message.includes('not found'))
-      );
-
-      // Don't update on 400 errors unless they're clearly model-related (not format issues)
-      const isModelRelated400 = (
-        error.response?.status === 400 &&
-        error.response?.data?.error?.message &&
-        (error.response.data.error.message.includes('not found') ||
-          error.response.data.error.message.includes('model'))
-      );
-
-      const shouldUpdateModel = (
-        session.preferredModel === model &&
-        (isModelAvailabilityError || isModelRelated400)
-      );
-
-      if (shouldUpdateModel) {
-        console.log(`🔄 [SERVER] Session ${sessionId.substring(0, 8)}... model ${model} failed (${error.response?.status}), updating to ${GLOBAL_MODEL_CONFIG.primaryModel}`);
-        session.preferredModel = GLOBAL_MODEL_CONFIG.primaryModel;
-        sessions.set(sessionId, session);
-        await saveSessions();
-        console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${GLOBAL_MODEL_CONFIG.primaryModel}`);
-      }
-    }
-
-    // Switch models on 429 errors (rate limit) immediately without retrying same model
-    if (error.response?.status === 429) {
-      const fallbacks = modelFallbacks[model] || [];
-
-      console.log(`🔍 [SERVER] Model switching debug:`, {
-        model: model,
-        errorStatus: error.response?.status,
-        retryCount: retryCount,
-        maxRetries: maxRetries,
-        fallbackAttempt: fallbackAttempt,
-        fallbacksAvailable: fallbacks.length,
-        fallbacks: fallbacks
-      });
-
-      if (fallbackAttempt < fallbacks.length) {
-        const nextModel = fallbacks[fallbackAttempt];
-        console.log(`🔄 [SERVER] Model ${model} hit rate limit (429), switching to fallback model: ${nextModel} (attempt ${fallbackAttempt + 1}/${fallbacks.length})`);
-        console.log(`📝 [SERVER] Preserving conversation context: ${conversationHistory?.length || 0} messages`);
-
-        // Validate conversation history before switching models
-        if (conversationHistory && conversationHistory.length > 0) {
-          console.log(`✅ [SERVER] Conversation history validated: ${conversationHistory.length} messages preserved`);
-          console.log(`📋 [SERVER] Conversation history details during model switch:`, {
-            roles: conversationHistory.map(msg => msg.role),
-            hasSystemMessage: conversationHistory.some(msg => msg.role === 'user' && msg.content.includes('AVAILABLE TOOLS')),
-            systemMessagePreview: conversationHistory.find(msg => msg.role === 'user' && msg.content.includes('AVAILABLE TOOLS'))?.content.substring(0, 100) + '...'
-          });
-        } else {
-          console.warn(`⚠️ [SERVER] Empty conversation history during model switch`);
-        }
-
-        // Update session's preferred model if sessionId is provided
-        if (sessionId && sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          session.preferredModel = nextModel;
-          sessions.set(sessionId, session);
-          await saveSessions();
-          console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${nextModel}`);
-        } else {
-          console.warn(`⚠️ [SERVER] No sessionId provided or session not found for model switch`);
-        }
-
-        // Try with the next fallback model, using compaction for rate limit recovery
-        const compactedHistory = await compactConversationHistory(conversationHistory, {
-          maxMessages: 6,
-          maxTotalLength: 4000, // More aggressive for rate limit recovery
-          preserveSystemMessage: true,
-          preserveRecentMessages: 4
-        });
-
-        return geminiGenerateContent({
-          model: nextModel,
-          currentMessage,
-          conversationHistory: compactedHistory,
-          systemPrompt, // Preserve system prompt
-          retryCount: 0,
-          fallbackAttempt: fallbackAttempt + 1,
-          sessionId,
-          requestId
-        });
-      } else {
-        console.error(`❌ [SERVER] All fallback models exhausted for ${model}. No more models available.`);
-      }
-    }
-
-    throw error;
-  }
-}
-
-// Test Gemini API connection on startup
-const testGeminiConnection = async () => {
-  if (!geminiApiKey) {
-    console.log('⚠️ [SERVER] Skipping Gemini API test - no API key configured');
-    return;
-  }
-
-  try {
-    console.log('🔄 [SERVER] Fetching available models from Gemini API...');
-
-    // Fetch available models from Gemini API
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models?key=' + geminiApiKey);
-    const data = await response.json();
-
-    if (!data.models) {
-      console.error('❌ [SERVER] Failed to fetch models from Gemini API');
-      return;
-    }
-
-    // Filter models that support generateContent
-    const availableModels = data.models.filter(model =>
-      model.supportedGenerationMethods &&
-      model.supportedGenerationMethods.includes('generateContent')
-    );
-
-    console.log(`📋 [SERVER] Found ${availableModels.length} models that support generateContent`);
-
-    // Update global configuration based on available models
-    GLOBAL_MODEL_CONFIG.updateFromAvailableModels(availableModels);
-
-    // Test the primary model first, then a few others
-    const testModels = [
-      GLOBAL_MODEL_CONFIG.primaryModel,
-      ...availableModels.slice(0, 3).map(m => m.name.replace('models/', ''))
-    ].filter((model, index, arr) => arr.indexOf(model) === index); // Remove duplicates
-
-    console.log(`🧪 [SERVER] Testing ${testModels.length} models: ${testModels.join(', ')}`);
-
-    for (const model of testModels) {
-      try {
-        console.log(`🔄 [SERVER] Testing Google Gemini API connection with model: ${model}...`);
-        const modelResult = await callModel({
-          model: model,
-          currentMessage: 'Hello',
-          options: {
-            enableModelSwitching: false, // Disable switching for connection test
-            enableCompaction: false
-          }
-        });
-        const data = modelResult.data;
-        if (data && data.candidates) {
-          console.log(`✅ [SERVER] Google Gemini API connection successful with model: ${model}`);
-          return; // Success, no need to test other models
-        } else {
-          console.log(`⚠️ [SERVER] Gemini API responded but no candidates in response for model: ${model}`);
-        }
-      } catch (error) {
-        console.log(`❌ [SERVER] Model ${model} failed:`, error.response?.status || error.message);
-        // Continue to next model
-      }
-    }
-
-    console.error('❌ [SERVER] All tested Gemini models failed. Please check your GEMINI_API_KEY and internet connection');
-
-  } catch (error) {
-    console.error('❌ [SERVER] Failed to fetch models from Gemini API:', error.message);
-    console.error('❌ [SERVER] Please check your GEMINI_API_KEY and internet connection');
-  }
-};
-
-testGeminiConnection();
-
 // Google Calendar API setup
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -931,15 +183,6 @@ const oauth2Client = new google.auth.OAuth2(
 
 // Store active watch subscriptions
 const watchSubscriptions = new Map();
-
-// Track model availability and performance - using global config
-const modelStatus = {};
-
-// Initialize model status for all models in global config
-const allModels = [GLOBAL_MODEL_CONFIG.primaryModel, ...GLOBAL_MODEL_CONFIG.fallbackModels];
-allModels.forEach(model => {
-  modelStatus[model] = { available: true, lastError: null, errorCount: 0 };
-});
 
 // Google Calendar Watch API setup
 const setupCalendarWatch = async (sessionId, oauth2Client) => {
@@ -958,7 +201,7 @@ const setupCalendarWatch = async (sessionId, oauth2Client) => {
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
     // Create a unique webhook URL for this session
-    const webhookUrl = `${process.env.CLIENT_URL || 'http://localhost:3000'}/api/calendar/webhook/${sessionId}`;
+    const webhookUrl = `${process.env.CLIENT_URL || 'http://localhost:30001'}/api/calendar/webhook/${sessionId}`;
 
     const watchRequest = {
       id: `vibe-calendar-${sessionId}`,
@@ -1070,6 +313,35 @@ const requireAuth = async (req, res, next) => {
   oauth2Client.setCredentials(updatedSession.tokens);
   req.session = updatedSession;
   next();
+}
+
+// Unified model call function with automatic model switching
+async function callModel({
+  conversationHistory = [],
+  currentMessage,
+  systemPrompt = null,
+  sessionId = null,
+  options = {}
+}) {
+  // Always use getCurrentModel
+  const currentModel = getCurrentModel(sessionId);
+  const result = await geminiGenerateContent({
+    model: currentModel,
+    conversationHistory,
+    currentMessage,
+    systemPrompt,
+    sessionId,
+    ...options
+  });
+  // If a fallback model was used, update the session's preferredModel
+  if (result.fallbackModel && sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId);
+    session.preferredModel = result.fallbackModel;
+    sessions.set(sessionId, session);
+    await saveSessions();
+    console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${result.fallbackModel}`);
+  }
+  return result.data;
 };
 
 // Routes
@@ -1093,18 +365,7 @@ app.get('/api/health', (req, res) => {
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     sessions: sessions.size,
-    modelStatus: modelStatus
-  });
-});
-
-// Force update session models endpoint (for testing)
-app.post('/api/admin/update-session-models', (req, res) => {
-  console.log('🔄 [SERVER] Manual session model update requested');
-  GLOBAL_MODEL_CONFIG.forceUpdateAllSessions();
-  res.json({
-    success: true,
-    message: 'Session models updated to use current global model',
-    primaryModel: GLOBAL_MODEL_CONFIG.primaryModel
+    modelStatus: getModelStatus()
   });
 });
 
@@ -1172,7 +433,6 @@ app.get('/api/health/ai', async (req, res) => {
   try {
     console.log('🔄 [SERVER] Testing Gemini API connection...');
     const modelResult = await callModel({
-      model: GLOBAL_MODEL_CONFIG.primaryModel,
       currentMessage: 'Hello, this is a test message.',
       options: {
         enableModelSwitching: false, // Disable switching for health check
@@ -1186,7 +446,7 @@ app.get('/api/health/ai', async (req, res) => {
       status: 'OK',
       message: 'AI service is available',
       aiAvailable: true,
-      model: GLOBAL_MODEL_CONFIG.primaryModel,
+      model: modelResult.fallbackModel,
       responseReceived: !!data.candidates,
       timestamp: new Date().toISOString()
     });
@@ -1258,7 +518,6 @@ app.get('/api/auth/google/callback', async (req, res) => {
       tokens,
       createdAt: new Date(),
       conversationHistory: [],
-      preferredModel: GLOBAL_MODEL_CONFIG.primaryModel // Default preferred model
     });
 
     // Save sessions to persistent storage
@@ -1554,18 +813,18 @@ app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
     const userTimezone = timezone || 'UTC';
 
     // Build system message for AI
-    const systemPrompt = generateGlobalSystemPrompt(userTimezone);
+    const systemPrompt = generateGlobalSystemPrompt(userTimezone, toolHandlers);
 
     // Get conversation history
     let fullConversationHistory = userSession.conversationHistory || [];
 
-            // Apply compaction if needed
-        fullConversationHistory = await compactConversationHistory(fullConversationHistory, {
-          maxMessages: 40,
-          maxTotalLength: 25000,
-          preserveRecentMessages: 15,
-          useAI: true,
-          model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
+    // Apply compaction if needed
+    fullConversationHistory = await compactConversationHistory(fullConversationHistory, {
+      maxMessages: 40,
+      maxTotalLength: 25000,
+      preserveRecentMessages: 15,
+      useAI: true,
+      model: getCurrentModel(sessionId),
       sessionId: sessionId
     });
 
@@ -1578,7 +837,6 @@ app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
         while (true) {
           // Get AI response
           const modelResult = await callModel({
-            model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
             conversationHistory: currentConversationHistory,
             currentMessage: currentMessage,
             systemPrompt: systemPrompt,
@@ -1587,7 +845,7 @@ app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
             options: { enableModelSwitching: true, enableCompaction: currentMessage === '' }
           });
 
-          const aiResponseText = modelResult.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          const aiResponseText = modelResult.candidates?.[0]?.content?.parts?.[0]?.text || '';
           const aiResponse = parseAiResponse(aiResponseText);
 
           // Add user message to conversation history (first iteration only)
@@ -1678,7 +936,7 @@ app.get('/api/ai/schedule-stream', aiLimiter, async (req, res) => {
               await refreshTokenIfNeeded(sessionId, userSession);
 
               // Execute tool
-              const toolResult = await processTool(toolRequest.tool, toolRequest.parameters, sessionId, oauth2Client);
+              const toolResult = await processTool(toolRequest.tool, toolRequest.parameters, sessionId, oauth2Client, toolHandlers);
               toolResults.push(toolResult);
 
             } catch (toolError) {
@@ -1782,7 +1040,7 @@ app.post('/api/ai/confirm-tools', aiLimiter, requireAuth, async (req, res) => {
         console.log(`🔧 [SERVER] Executing confirmed tool ${index + 1}/${tools.length}: ${toolRequest.tool}`);
 
         // Use unified tool processing
-        const toolResult = await processTool(toolRequest.tool, toolRequest.parameters, sessionId, oauth2Client);
+        const toolResult = await processTool(toolRequest.tool, toolRequest.parameters, sessionId, oauth2Client, toolHandlers);
         toolResults.push(toolResult);
 
         console.log(`✅ [SERVER] Confirmed tool ${index + 1} completed:`, {
@@ -2250,7 +1508,6 @@ Suggest optimal Pomodoro strategy:`;
   try {
     const aiStartTime = Date.now();
     const modelResult = await callModel({
-      model: GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId),
       currentMessage: prompt,
       sessionId: sessionId,
       requestId: requestId,
@@ -2627,84 +1884,6 @@ app.delete('/api/calendar/events/:eventId', requireAuth, calendarEventLimiter, a
   }
 });
 
-// Helper function to find available time slots
-async function findAvailableTimeSlots(constraints, oauth2Client) {
-  try {
-    const { startDate, endDate, duration, workingHours } = constraints;
-
-    console.log('🔄 [SERVER] Finding available time slots:', {
-      startDate,
-      endDate,
-      duration,
-      workingHours
-    });
-
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-    // Get existing events in the date range
-    console.log('🌐 [SERVER] Making Google Calendar API call to get existing events...', {
-      timeMin: startDate,
-      timeMax: endDate
-    });
-
-    const response = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: startDate,
-      timeMax: endDate,
-      singleEvents: true,
-      orderBy: 'startTime'
-    });
-
-    const events = response.data.items || [];
-
-    console.log('✅ [SERVER] Existing events retrieved for time slot calculation:', {
-      eventCount: events.length,
-      timeRange: `${startDate} to ${endDate}`
-    });
-
-    // Generate time slots and filter out busy times
-    const timeSlots = [];
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-
-    for (let date = new Date(start); date < end; date.setDate(date.getDate() + 1)) {
-      const dayStart = new Date(date);
-      dayStart.setHours(workingHours.start, 0, 0, 0);
-
-      const dayEnd = new Date(date);
-      dayEnd.setHours(workingHours.end, 0, 0, 0);
-
-      for (let time = new Date(dayStart); time < dayEnd; time.setMinutes(time.getMinutes() + 30)) {
-        const slotEnd = new Date(time.getTime() + duration * 60 * 1000);
-
-        // Check if slot conflicts with existing events
-        const conflicts = events.some(event => {
-          const eventStart = new Date(event.start.dateTime || event.start.date);
-          const eventEnd = new Date(event.end.dateTime || event.end.date);
-          return time < eventEnd && slotEnd > eventStart;
-        });
-
-        if (!conflicts) {
-          timeSlots.push(time.toISOString());
-        }
-      }
-    }
-
-    console.log('✅ [SERVER] Available time slots calculated:', {
-      totalSlots: timeSlots.length,
-      dateRange: `${startDate} to ${endDate}`
-    });
-
-    return timeSlots;
-  } catch (error) {
-    console.error('❌ [SERVER] Error finding time slots:', {
-      error: error.message,
-      constraints: constraints
-    });
-    return [];
-  }
-}
-
 // Debug endpoint to clear conversation history for the current session
 app.post('/api/debug/clear-history', requireAuth, async (req, res) => {
   const sessionId = req.headers['x-session-id'];
@@ -2712,9 +1891,8 @@ app.post('/api/debug/clear-history', requireAuth, async (req, res) => {
     return res.status(401).json({ success: false, error: 'No valid session found' });
   }
   const session = sessions.get(sessionId);
-  console.log('💾 [SERVER] Clearing conversation history for sessionId: ', sessionId,  'conversationHistory: ', session.conversationHistory);
+  console.log('💾 [SERVER] Clearing conversation history for sessionId: ', sessionId, 'conversationHistory: ', session.conversationHistory);
   session.conversationHistory = [];
-  session.preferredModel = GLOBAL_MODEL_CONFIG.primaryModel;
   sessions.set(sessionId, session);
   await saveSessions();
   console.log('💾 [SERVER] Conversation history cleared');
@@ -2751,393 +1929,4 @@ const server = app.listen(PORT, () => {
   process.exit(1);
 });
 
-// Utility to estimate token usage (very rough, 1 token ≈ 4 chars for English)
-function estimateTokenCount(messages) {
-  return Math.ceil(messages.reduce((sum, msg) => {
-    const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-    return sum + (contentStr?.length || 0);
-  }, 0) / 4);
-}
-
-// Unified model call function with automatic model switching
-async function callModel({
-  model,
-  conversationHistory = [],
-  currentMessage,
-  systemPrompt = null,
-  sessionId = null,
-  options = {}
-}) {
-  const {
-    maxRetries = 3,
-    baseDelay = 1000,
-    enableModelSwitching = true,
-    enableCompaction = true,
-    timeout = 25000
-  } = options;
-
-  // Get the model to use (session model or provided model)
-  let currentModel = model;
-  if (sessionId) {
-    // Use getCurrentModel for consistency if sessionId is provided
-    currentModel = GLOBAL_MODEL_CONFIG.getCurrentModel(sessionId);
-  }
-
-  // Ensure we have a valid model
-  if (!currentModel) {
-    currentModel = GLOBAL_MODEL_CONFIG.primaryModel;
-  }
-
-  try {
-    // Use the existing geminiGenerateContent function
-    const result = await geminiGenerateContent({
-      model: currentModel,
-      conversationHistory,
-      currentMessage,
-      systemPrompt,
-      sessionId,
-      retryCount: 0,
-      fallbackAttempt: 0
-    });
-
-    return {
-      success: true,
-      data: result,
-      model: currentModel,
-      switched: false
-    };
-
-  } catch (error) {
-
-    // If model switching is disabled, throw the error
-    if (!enableModelSwitching) {
-      throw error;
-    }
-
-    // Try model switching
-    const fallbacks = GLOBAL_MODEL_CONFIG.fallbackModels;
-    const currentModelIndex = fallbacks.indexOf(currentModel);
-    const availableFallbacks = fallbacks.slice(currentModelIndex + 1);
-
-    if (availableFallbacks.length === 0) {
-      console.error('❌ [SERVER] No fallback models available');
-      throw error;
-    }
-
-    // Try each fallback model
-    for (let i = 0; i < availableFallbacks.length; i++) {
-      const fallbackModel = availableFallbacks[i];
-
-      try {
-        console.log(`🔄 [SERVER] Trying fallback model ${i + 1}/${availableFallbacks.length}: ${fallbackModel}`);
-
-        // Apply compaction if enabled and conversation is large
-        let optimizedHistory = conversationHistory;
-        if (enableCompaction && conversationHistory.length > 10) {
-          optimizedHistory = await compactConversationHistory(conversationHistory, {
-            useAI: true,
-            model: fallbackModel,
-            sessionId: sessionId
-          });
-        }
-
-        const result = await geminiGenerateContent({
-          model: fallbackModel,
-          conversationHistory: optimizedHistory,
-          currentMessage,
-          systemPrompt,
-          sessionId,
-          retryCount: 0,
-          fallbackAttempt: 0
-        });
-
-        // Update session's preferred model
-        if (sessionId && sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          session.preferredModel = fallbackModel;
-          sessions.set(sessionId, session);
-          await saveSessions();
-          console.log(`💾 [SERVER] Updated session ${sessionId.substring(0, 8)}... preferred model to: ${fallbackModel}`);
-        }
-
-        console.log(`✅ [SERVER] Model switch successful: ${currentModel} → ${fallbackModel}`);
-
-        return {
-          success: true,
-          data: result,
-          model: fallbackModel,
-          switched: true,
-          originalModel: currentModel
-        };
-
-      } catch (fallbackError) {
-        console.error(`❌ [SERVER] Fallback model ${fallbackModel} failed:`, fallbackError.message);
-
-        // If this is the last fallback, throw the original error
-        if (i === availableFallbacks.length - 1) {
-          throw error;
-        }
-      }
-    }
-
-    // If we get here, all fallbacks failed
-    throw error;
-  }
-}
-
-// Unified conversation history compaction utility with AI fallback
-const compactConversationHistory = async (conversationHistory, options = {}) => {
-  // Hard Gemini API limits (tokens/chars)
-  const HARD_CHAR_LIMIT = 30000;
-  const HARD_TOKEN_LIMIT = 8000;
-  const SAFE_CHAR_LIMIT = 0.9 * HARD_CHAR_LIMIT;
-  const SAFE_TOKEN_LIMIT = 0.9 * HARD_TOKEN_LIMIT;
-
-  // Find all pinned or important messages
-  const pinnedMessages = conversationHistory.filter(msg => msg.pinned || msg.important);
-
-  // Always preserve pinned/important and recent N messages
-  const preserveRecent = options.preserveRecent || 12;
-  const recentMessages = conversationHistory.slice(-preserveRecent);
-
-  // Build initial preserved set
-  let preserved = [];
-  pinnedMessages.forEach(msg => {
-    if (!preserved.includes(msg)) preserved.push(msg);
-  });
-  recentMessages.forEach(msg => {
-    if (!preserved.includes(msg)) preserved.push(msg);
-  });
-
-  // Remove duplicates
-  const seen = new Set();
-  preserved = preserved.filter(msg => {
-    // Use role + content hash for deduplication
-    const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-    const key = `${msg.role}:${contentStr.substring(0, 100)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  // If under safe limits, return full history
-  const totalChars = conversationHistory.reduce((sum, msg) => {
-    const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-    return sum + (contentStr?.length || 0);
-  }, 0);
-  const totalTokens = estimateTokenCount(conversationHistory);
-  if (totalChars < SAFE_CHAR_LIMIT && totalTokens < SAFE_TOKEN_LIMIT) {
-    return conversationHistory;
-  }
-
-  // If over safe limits, try traditional compaction first
-  let compacted = [...preserved];
-  // Add as many older messages as possible (oldest first, not already preserved)
-  for (const msg of conversationHistory) {
-    if (!compacted.includes(msg) && !msg.pinned && !msg.important) {
-      compacted.push(msg);
-      const chars = compacted.reduce((sum, m) => {
-        const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-        return sum + (contentStr?.length || 0);
-      }, 0);
-      const tokens = estimateTokenCount(compacted);
-      if (chars > HARD_CHAR_LIMIT || tokens > HARD_TOKEN_LIMIT) {
-        compacted.pop();
-        break;
-      }
-    }
-  }
-
-  // Final check: if still over, trim oldest non-pinned until under limit
-  while (compacted.length > 0 && (compacted.reduce((sum, m) => {
-    const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-    return sum + (contentStr?.length || 0);
-  }, 0) > HARD_CHAR_LIMIT || estimateTokenCount(compacted) > HARD_TOKEN_LIMIT)) {
-    // Remove oldest non-pinned, non-important
-    const idx = compacted.findIndex(msg => !msg.pinned && !msg.important);
-    if (idx === -1) break;
-    compacted.splice(idx, 1);
-  }
-
-  // Only compact if actually over limits
-  if (totalChars < SAFE_CHAR_LIMIT && totalTokens < SAFE_TOKEN_LIMIT) {
-    return conversationHistory;
-  }
-
-  // If over limits, prefer AI-assisted compaction when available and enabled
-  if (options.useAI !== false && options.model && options.sessionId) {
-    console.log('🤖 [SERVER] Context too large, attempting AI-assisted compaction...');
-
-    try {
-      const compactPrompt = `The following conversation history is too long for the AI model to process efficiently.
-
-Please summarize or compact the conversation, preserving all important user requests, assistant responses, and any context needed for future scheduling or actions.
-
-Output the compacted conversation as a JSON array of messages, each with a role ('user' or 'model') and content. Do not include any explanation or extra text.`;
-
-      const compactInput = [
-        { role: 'user', content: compactPrompt },
-        ...conversationHistory
-      ];
-
-      const modelResult = await callModel({
-        model: options.model,
-        conversationHistory: compactInput,
-        currentMessage: '',
-        sessionId: options.sessionId,
-        options: {
-          enableModelSwitching: true,
-          enableCompaction: false // No need for compaction during compaction
-        }
-      });
-      const response = modelResult.data;
-
-      const aiText = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-      // Try to parse JSON array from AI response with robust parsing
-      let aiCompactedHistory = null;
-      try {
-        // First, try to extract JSON array from the response
-        const jsonArrayMatch = aiText.match(/\[\s*\{[\s\S]*\}\s*\]/);
-        if (jsonArrayMatch) {
-          aiCompactedHistory = JSON.parse(jsonArrayMatch[0]);
-        } else {
-          // Try to find any JSON structure
-          const jsonMatch = aiText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            // If it's an object, try to extract messages array
-            if (typeof parsed === 'object' && !Array.isArray(parsed)) {
-              aiCompactedHistory = parsed.messages || parsed.conversation || parsed.history;
-            } else if (Array.isArray(parsed)) {
-              aiCompactedHistory = parsed;
-            }
-          } else {
-            // Last resort: try to parse the entire text
-            aiCompactedHistory = JSON.parse(aiText);
-          }
-        }
-
-
-
-        // Validate that the parsed result is a valid conversation history
-        if (!Array.isArray(aiCompactedHistory) || aiCompactedHistory.length === 0) {
-          throw new Error('AI response is not a valid conversation history array');
-        }
-
-        // Validate each message has required fields
-        const validMessages = aiCompactedHistory.filter(msg =>
-          msg && typeof msg === 'object' &&
-          (msg.role === 'user' || msg.role === 'model') &&
-          msg.content
-        );
-
-        if (validMessages.length === 0) {
-          throw new Error('No valid messages found in AI response');
-        }
-
-        aiCompactedHistory = validMessages;
-
-        const aiCompactedChars = aiCompactedHistory.reduce((sum, m) => {
-          const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-          return sum + (contentStr?.length || 0);
-        }, 0);
-        const aiCompactedTokens = estimateTokenCount(aiCompactedHistory);
-
-        console.log('✅ [SERVER] AI-assisted compaction successful:', {
-          originalLength: conversationHistory.length,
-          aiCompactedLength: aiCompactedHistory.length,
-          originalChars: totalChars,
-          aiCompactedChars: aiCompactedChars,
-          originalTokens: totalTokens,
-          aiCompactedTokens: aiCompactedTokens,
-          pinnedCount: pinnedMessages.length
-        });
-
-        return aiCompactedHistory;
-      } catch (err) {
-        console.error('❌ [SERVER] Failed to parse AI-compacted history:', {
-          error: err.message,
-          errorType: err.constructor.name,
-          aiTextLength: aiText.length,
-          aiTextPreview: aiText.substring(0, 500) + '...',
-          fullAiText: aiText
-        });
-        // Fall back to traditional compaction
-      }
-    } catch (err) {
-      console.error('❌ [SERVER] AI-assisted compaction failed:', err);
-      // Fall back to traditional compaction
-    }
-  }
-
-  // Fall back to traditional compaction if AI fails or is disabled
-  const compactedChars = compacted.reduce((sum, m) => {
-    const contentStr = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-    return sum + (contentStr?.length || 0);
-  }, 0);
-  const compactedTokens = estimateTokenCount(compacted);
-
-  // Only log when actual compaction occurs (reduced size)
-  if (compacted.length < conversationHistory.length) {
-    console.log('📝 [SERVER] Using traditional compaction (AI failed or disabled):', {
-      originalLength: conversationHistory.length,
-      compactedLength: compacted.length,
-      originalChars: totalChars,
-      compactedChars: compactedChars,
-      originalTokens: totalTokens,
-      compactedTokens: compactedTokens,
-      pinnedCount: pinnedMessages.length
-    });
-  }
-
-  return compacted;
-};
-
-// Patch geminiGenerateContent error handling for auto-compaction fallback
-const originalGeminiGenerateContent = geminiGenerateContent;
-geminiGenerateContent = async function patchedGeminiGenerateContent(args) {
-  try {
-    return await originalGeminiGenerateContent(args);
-  } catch (error) {
-    // Only fallback on size/token/timeout errors
-    const isSizeError = error?.response?.status === 400 || error?.response?.status === 413 || (error.message && error.message.toLowerCase().includes('token'));
-    const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.toLowerCase().includes('timeout'));
-    if ((isSizeError || isTimeout) && args.conversationHistory && args.conversationHistory.length > 0) {
-      console.warn('🤖 [SERVER] Triggering unified compaction fallback...');
-      const compacted = await compactConversationHistory(args.conversationHistory, {
-        model: args.model,
-        sessionId: args.sessionId,
-        useAI: true
-      });
-      if (compacted && compacted.length > 0) {
-        // Update session with compacted history (no notification message)
-        if (args.sessionId && sessions.has(args.sessionId)) {
-          const session = sessions.get(args.sessionId);
-          session.conversationHistory = compacted;
-          sessions.set(args.sessionId, session);
-          await saveSessions();
-          console.log('💾 [SERVER] Session updated with compacted history (no notification message)');
-        }
-        // Retry original request with compacted history
-        return await originalGeminiGenerateContent({ ...args, conversationHistory: compacted });
-      }
-    }
-    throw error;
-  }
-};
-
-// Helper function to enforce rate limiting for calendar operations
-const enforceCalendarRateLimit = async (sessionId, operationType = 'calendar') => {
-  const now = Date.now();
-  const lastOperation = calendarRateLimiter.get(sessionId);
-  const minInterval = 1000; // 1 second minimum between operations
-
-  if (lastOperation && (now - lastOperation) < minInterval) {
-    const waitTime = minInterval - (now - lastOperation);
-    console.log(`⏳ [SERVER] Rate limiting calendar operation for session ${sessionId.substring(0, 8)}..., waiting ${waitTime}ms`);
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-  }
-
-  calendarRateLimiter.set(sessionId, Date.now());
-};
+registerGracefulShutdown(server);
